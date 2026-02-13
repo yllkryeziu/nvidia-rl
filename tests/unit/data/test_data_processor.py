@@ -191,6 +191,66 @@ def test_math_hf_data_processor_without_prompt():
     assert "Solve 1+1." in result["message_log"][0]["content"]
 
 
+def test_math_hf_data_processor_with_named_placeholder_prompt():
+    datum_dict = {
+        "messages": [
+            {"role": "user", "content": "Solve 1+1."},
+            {"role": "assistant", "content": "2"},
+        ],
+        "task_name": "math",
+    }
+    tokenizer = DummyTokenizer()
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        f.write("Problem: {problem}")
+        prompt_file = f.name
+
+    math_task_spec = TaskDataSpec(
+        task_name="math",
+        prompt_file=prompt_file,
+        system_prompt_file=None,
+    )
+    result = math_hf_data_processor(
+        datum_dict=datum_dict,
+        task_data_spec=math_task_spec,
+        tokenizer=tokenizer,
+        max_seq_length=128,
+        idx=0,
+    )
+
+    assert "Problem: Solve 1+1." in result["message_log"][0]["content"]
+
+
+def test_math_hf_data_processor_with_positional_placeholder_prompt():
+    datum_dict = {
+        "messages": [
+            {"role": "user", "content": "Solve 2+2."},
+            {"role": "assistant", "content": "4"},
+        ],
+        "task_name": "math",
+    }
+    tokenizer = DummyTokenizer()
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        f.write("Problem: {}")
+        prompt_file = f.name
+
+    math_task_spec = TaskDataSpec(
+        task_name="math",
+        prompt_file=prompt_file,
+        system_prompt_file=None,
+    )
+    result = math_hf_data_processor(
+        datum_dict=datum_dict,
+        task_data_spec=math_task_spec,
+        tokenizer=tokenizer,
+        max_seq_length=128,
+        idx=0,
+    )
+
+    assert "Problem: Solve 2+2." in result["message_log"][0]["content"]
+
+
 @pytest.fixture
 def system_prompt_file(request):
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as file:

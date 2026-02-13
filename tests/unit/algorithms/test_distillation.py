@@ -20,9 +20,11 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 import nemo_rl.algorithms.distillation as distil_mod
 from nemo_rl.algorithms.distillation import (
+    _align_teacher_topk_to_student,
     _default_distillation_save_state,
     check_vocab_equality,
     distillation_train,
+    setup,
     validate,
 )
 from nemo_rl.algorithms.loss_functions import DistillationLossFn
@@ -475,6 +477,55 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
         setup(master_config, tokenizer, dataset, None)
 
 
+def test_setup_self_distillation_requires_same_model_name():
+    master_config = {
+        "policy": {
+            "model_name": "student-model",
+            "generation": {
+                "backend": "vllm",
+                "colocated": {"enabled": True, "resources": {}},
+            },
+            "dtensor_cfg": {"enabled": False},
+        },
+        "teacher": {
+            "model_name": "teacher-model",
+            "dtensor_cfg": {"enabled": False},
+        },
+        "loss_fn": {
+            "kl_type": "forward",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,
+        },
+        "distillation": {
+            "seed": 42,
+            "self_distillation": True,
+            "num_prompts_per_step": 1,
+            "max_num_epochs": 1,
+            "max_num_steps": 1,
+            "val_period": 0,
+            "val_at_start": False,
+            "val_at_end": False,
+            "val_batch_size": 1,
+            "max_val_samples": 1,
+            "topk_logits_k": 4,
+        },
+        "data": {"shuffle": False},
+        "logger": {},
+        "checkpointing": {},
+        "cluster": {"num_nodes": 1, "gpus_per_node": 1},
+    }
+
+    tokenizer = MagicMock()
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=1)
+
+    with pytest.raises(
+        AssertionError,
+        match="self_distillation=true requires teacher.model_name to equal policy.model_name",
+    ):
+        setup(master_config, tokenizer, dataset, None)
+
+
 def test_distillation_setup_non_colocated_smoke(monkeypatch):
     """Smoke test: calling setup with a non-colocated config should succeed."""
     from unittest.mock import MagicMock, patch
@@ -655,3 +706,51 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
         # Configure mocks to skip checkpoint loading
         mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
         setup(master_config, tokenizer, dataset, None)
+
+
+def test_align_teacher_topk_to_student_smoke():
+    teacher_topk_logits = torch.arange(3 * 6 * 2, dtype=torch.float32).reshape(3, 6, 2)
+    teacher_topk_indices = torch.arange(3 * 6 * 2, dtype=torch.int64).reshape(3, 6, 2)
+    student_token_mask = torch.zeros((3, 8), dtype=torch.int64)
+
+    # Sample 0: 3 answer tokens -> 3 student rows; teacher span has only 2 rows.
+    student_token_mask[0, 3:6] = 1
+    # Sample 1: 2 answer tokens; teacher span starts near the end and truncates to 1 row.
+    student_token_mask[1, 1:3] = 1
+    # Sample 2: has answer tokens, but teacher span is empty.
+    student_token_mask[2, 2:4] = 1
+
+    teacher_solution_row_ranges = [
+        (1, 2),  # rows 1,2
+        (5, 3),  # only row 5 fits in seq_len=6
+        (2, 0),  # empty span
+    ]
+
+    aligned_logits, aligned_indices, aligned_mask = _align_teacher_topk_to_student(
+        teacher_topk_logits=teacher_topk_logits,
+        teacher_topk_indices=teacher_topk_indices,
+        student_token_mask=student_token_mask,
+        teacher_solution_row_ranges=teacher_solution_row_ranges,
+    )
+
+    # Sample 0 mapping: token positions 3,4,5 -> student rows 2,3,4. Copy first 2 rows.
+    assert torch.equal(aligned_logits[0, 2], teacher_topk_logits[0, 1])
+    assert torch.equal(aligned_logits[0, 3], teacher_topk_logits[0, 2])
+    assert torch.equal(aligned_indices[0, 2], teacher_topk_indices[0, 1])
+    assert torch.equal(aligned_indices[0, 3], teacher_topk_indices[0, 2])
+    assert torch.equal(aligned_logits[0, 4], torch.zeros(2))
+    assert aligned_mask[0, 3].item() == 1
+    assert aligned_mask[0, 4].item() == 1
+    assert aligned_mask[0, 5].item() == 0
+
+    # Sample 1 mapping: token positions 1,2 -> student rows 0,1. Only one teacher row available.
+    assert torch.equal(aligned_logits[1, 0], teacher_topk_logits[1, 5])
+    assert torch.equal(aligned_indices[1, 0], teacher_topk_indices[1, 5])
+    assert torch.equal(aligned_logits[1, 1], torch.zeros(2))
+    assert aligned_mask[1, 1].item() == 1
+    assert aligned_mask[1, 2].item() == 0
+
+    # Sample 2 has empty teacher span: no aligned rows/tokens.
+    assert torch.count_nonzero(aligned_logits[2]).item() == 0
+    assert torch.count_nonzero(aligned_indices[2]).item() == 0
+    assert torch.count_nonzero(aligned_mask[2]).item() == 0

@@ -77,12 +77,20 @@ def main() -> None:
         print("  ⚠️ No generation config found, this may cause issues")
 
     # setup data
-    (
-        dataset,
-        val_dataset,
-        task_to_env,
-        val_task_to_env,
-    ) = setup_response_data(tokenizer, config["data"], config["env"])
+    use_environment_rollout = config["distillation"].get("use_environment_rollout", True)
+    if use_environment_rollout:
+        (
+            dataset,
+            val_dataset,
+            task_to_env,
+            val_task_to_env,
+        ) = setup_response_data(tokenizer, config["data"], config["env"])
+    else:
+        dataset, val_dataset = setup_response_data(
+            tokenizer, config["data"], env_configs=None
+        )
+        task_to_env = {}
+        val_task_to_env = None
 
     (
         student_policy,

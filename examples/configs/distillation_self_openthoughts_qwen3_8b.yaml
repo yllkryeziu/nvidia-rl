@@ -1,0 +1,43 @@
+defaults: distillation_math.yaml
+
+distillation:
+    use_environment_rollout: false
+    self_distillation: true
+    teacher_prompt_template: |
+        You will see a problem and a student solution, improve the solution.
+        Problem: {problem}
+        Student solution: {solution}
+    teacher_problem_key: "ground_truth"
+    val_period: 0
+    val_at_start: false
+    val_at_end: false
+
+loss_fn:
+    kl_type: "reverse"
+
+policy:
+    model_name: "Qwen/Qwen3-8B"
+    tokenizer:
+        name: ${..model_name}
+
+teacher:
+    model_name: ${policy.model_name}
+    dtensor_cfg:
+        context_parallel_size: ${policy.dtensor_cfg.context_parallel_size}
+        tensor_parallel_size: ${policy.dtensor_cfg.tensor_parallel_size}
+
+data:
+    train:
+        dataset_name: "ResponseDataset"
+        data_path: "open-thoughts/OpenThoughts-114k"
+        subset: "metadata"
+        split: "train"
+        input_key: "problem"
+        output_key: "problem"
+        processor: "math_hf_data_processor"
+    validation: null
+    default:
+        prompt_file: "examples/prompts/self_distill_student_math.txt"
+        system_prompt_file: null
+
+env: {}

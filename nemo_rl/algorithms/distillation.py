@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and limitations.
 # limitations under the License.
+import asyncio
 import os
 import warnings
 from pathlib import Path
@@ -45,6 +46,8 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
+    generate_responses,
+    generate_responses_async,
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
 )
@@ -86,6 +89,11 @@ class DistillationConfig(TypedDict):
     max_val_samples: int
     topk_logits_k: int
     seed: int
+    # Optional self-distillation config
+    use_environment_rollout: NotRequired[bool]
+    self_distillation: NotRequired[bool]
+    teacher_prompt_template: NotRequired[str | None]
+    teacher_problem_key: NotRequired[str]
 
 
 class DistillationSaveState(TypedDict):
@@ -192,6 +200,10 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for distillation"
     )
+    if distillation_config.get("self_distillation", False):
+        assert policy_config["model_name"] == teacher_config["model_name"], (
+            "distillation.self_distillation=true requires teacher.model_name to equal policy.model_name."
+        )
 
     # Disallow SP + packing for dtensor path
     for cfg, who in ((policy_config, "student"), (teacher_config, "teacher")):
@@ -503,6 +515,263 @@ def setup(
 # ===============================================================================
 
 
+def _extract_problem_text(
+    message_log: list[dict[str, Any]],
+    extra_env_info: Any,
+    teacher_problem_key: str,
+) -> str:
+    """Extract problem text from metadata or fallback to first user message."""
+    if (
+        isinstance(extra_env_info, dict)
+        and teacher_problem_key in extra_env_info
+        and extra_env_info[teacher_problem_key] is not None
+    ):
+        return str(extra_env_info[teacher_problem_key])
+
+    for msg in message_log:
+        if msg.get("role") == "user" and msg.get("content") is not None:
+            return str(msg["content"])
+
+    raise ValueError(
+        f"Could not extract problem text from extra_env_info['{teacher_problem_key}'] or user messages."
+    )
+
+
+def _run_generation_only_rollout(
+    policy_generation: GenerationInterface,
+    input_batch: BatchedDataDict[DatumSpec],
+    tokenizer: TokenizerType,
+    master_config: MasterConfig,
+) -> tuple[BatchedDataDict[DatumSpec], dict[str, Any]]:
+    """Run a single-turn generation rollout without environment interaction."""
+    generation_batch = input_batch.copy()
+    flat_messages, input_lengths = batched_message_log_to_flat_message(
+        generation_batch["message_log"],
+        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+    )
+
+    generation_input_data = BatchedDataDict(
+        {
+            "input_ids": flat_messages["token_ids"],
+            "input_lengths": input_lengths,
+        }
+    )
+    generation_input_data.update(flat_messages.get_multimodal_dict(as_tensors=False))
+
+    # Keep optional multimodal payload keys for vLLM backends.
+    for key in ("vllm_content", "vllm_images", "vllm_videos"):
+        if key in generation_batch:
+            generation_input_data[key] = generation_batch[key]
+
+    if _should_use_async_rollouts(master_config):
+        generation_batch, generated_ids, gen_metrics = asyncio.run(
+            generate_responses_async(
+                policy_generation=policy_generation,
+                generation_input_data=generation_input_data,
+                batch=generation_batch,
+                tokenizer=tokenizer,
+                input_lengths=input_lengths,
+                include_logprobs=True,
+                greedy=False,
+            )
+        )
+    else:
+        generation_batch, generated_ids, gen_metrics = generate_responses(
+            policy_generation=policy_generation,
+            generation_input_data=generation_input_data,
+            batch=generation_batch,
+            tokenizer=tokenizer,
+            input_lengths=input_lengths,
+            include_logprobs=True,
+            greedy=False,
+        )
+
+    response_truncated = gen_metrics.get("_response_truncated")
+    truncation_rate = 0.0
+    if response_truncated is not None:
+        truncation_rate = (
+            torch.as_tensor(response_truncated, dtype=torch.float32).mean().item()
+        )
+
+    rollout_metrics = {
+        "total_turns": generation_batch.size,
+        "avg_turns_per_sample": 1.0,
+        "max_turns_per_sample": 1,
+        "natural_termination_rate": 1.0,
+        "truncation_rate": truncation_rate,
+        "max_turns_reached_rate": 0.0,
+        "mean_total_tokens_per_sample": float(
+            np.mean([len(ids) for ids in generated_ids]) if generated_ids else 0.0
+        ),
+        "mean_gen_tokens_per_sample": float(gen_metrics["mean_generation_length"]),
+        "max_gen_tokens_per_sample": float(
+            np.max([len(ids) for ids in generated_ids]) if generated_ids else 0.0
+        ),
+        "mean_env_tokens_per_sample": 0.0,
+    }
+    return generation_batch, rollout_metrics
+
+
+def _build_teacher_conditioned_data(
+    repeated_batch: BatchedDataDict[DatumSpec],
+    tokenizer: TokenizerType,
+    master_config: MasterConfig,
+) -> tuple[BatchedDataDict[Any], list[tuple[int, int]]]:
+    """Build teacher input batch from teacher prompt template and student rollouts.
+
+    Returns teacher generation datum and per-sample (row_start, row_len) in teacher logits
+    corresponding to student solution tokens.
+    """
+    distillation_cfg = master_config["distillation"]
+    template = distillation_cfg.get("teacher_prompt_template")
+    if not template:
+        raise ValueError("teacher_prompt_template must be set for teacher conditioning.")
+
+    teacher_problem_key = distillation_cfg.get("teacher_problem_key", "ground_truth")
+    max_seq_len = master_config["policy"]["max_total_sequence_length"]
+
+    teacher_message_logs: list[list[dict[str, Any]]] = []
+    teacher_solution_row_ranges: list[tuple[int, int]] = []
+
+    for i, message_log in enumerate(repeated_batch["message_log"]):
+        assistant_msg = next(
+            (m for m in reversed(message_log) if m.get("role") == "assistant"), None
+        )
+        if assistant_msg is None:
+            raise ValueError("No assistant message found in student rollout batch.")
+
+        problem_text = _extract_problem_text(
+            message_log,
+            repeated_batch["extra_env_info"][i],
+            teacher_problem_key,
+        )
+        solution_text = str(assistant_msg.get("content", ""))
+
+        prefix_text = template.format(problem=problem_text, solution="")
+        full_text = template.format(problem=problem_text, solution=solution_text)
+
+        # Tokenize through chat template so teacher sees the exact context format.
+        prefix_chat = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prefix_text}],
+            tokenize=False,
+            add_generation_prompt=True,
+            add_special_tokens=False,
+        )
+        full_chat = tokenizer.apply_chat_template(
+            [{"role": "user", "content": full_text}],
+            tokenize=False,
+            add_generation_prompt=True,
+            add_special_tokens=False,
+        )
+        prefix_ids = tokenizer(
+            prefix_chat, return_tensors="pt", add_special_tokens=False
+        )["input_ids"][0]
+        full_ids = tokenizer(
+            full_chat, return_tensors="pt", add_special_tokens=False
+        )["input_ids"][0]
+
+        solution_start = int(prefix_ids.shape[0])
+        solution_len = int(full_ids.shape[0] - prefix_ids.shape[0])
+        if solution_len < 0:
+            raise ValueError(
+                "Teacher prompt tokenization produced invalid solution span (negative length)."
+            )
+
+        # Keep tail when over max sequence length to preserve the solution span.
+        if int(full_ids.shape[0]) > max_seq_len:
+            overflow = int(full_ids.shape[0]) - max_seq_len
+            full_ids = full_ids[overflow:]
+            solution_start = max(solution_start - overflow, 0)
+            solution_len = max(0, min(solution_len, max_seq_len - solution_start))
+
+        row_start = max(solution_start - 1, 0)
+        teacher_solution_row_ranges.append((row_start, solution_len))
+
+        teacher_message_logs.append(
+            [
+                {
+                    "role": "user",
+                    "content": tokenizer.decode(full_ids, skip_special_tokens=False),
+                    "token_ids": full_ids,
+                }
+            ]
+        )
+
+    teacher_flat, teacher_input_lengths = batched_message_log_to_flat_message(
+        teacher_message_logs,
+        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+        make_sequence_length_divisible_by=master_config["policy"][
+            "make_sequence_length_divisible_by"
+        ],
+    )
+    teacher_data = BatchedDataDict(
+        {
+            "input_ids": teacher_flat["token_ids"],
+            "input_lengths": teacher_input_lengths,
+        }
+    )
+    teacher_data.update(teacher_flat.get_multimodal_dict(as_tensors=False))
+    teacher_data.to("cpu")
+    return teacher_data, teacher_solution_row_ranges
+
+
+def _align_teacher_topk_to_student(
+    teacher_topk_logits: torch.Tensor,
+    teacher_topk_indices: torch.Tensor,
+    student_token_mask: torch.Tensor,
+    teacher_solution_row_ranges: list[tuple[int, int]],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Align teacher top-k tensors to student sequence layout.
+
+    Returns aligned teacher tensors and an updated student token mask that only includes
+    positions that were successfully aligned.
+    """
+    batch_size, seq_len = student_token_mask.shape
+    topk_k = teacher_topk_logits.shape[-1]
+
+    aligned_logits = torch.zeros(
+        (batch_size, seq_len, topk_k),
+        dtype=teacher_topk_logits.dtype,
+        device=teacher_topk_logits.device,
+    )
+    aligned_indices = torch.zeros(
+        (batch_size, seq_len, topk_k),
+        dtype=teacher_topk_indices.dtype,
+        device=teacher_topk_indices.device,
+    )
+    aligned_token_mask = torch.zeros_like(student_token_mask)
+
+    for b in range(batch_size):
+        token_positions = torch.where(student_token_mask[b] > 0)[0].tolist()
+        # Each token at position p is predicted by logits at row p-1.
+        student_row_positions = [p - 1 for p in token_positions if p > 0]
+
+        row_start, row_len = teacher_solution_row_ranges[b]
+        if row_len <= 0:
+            continue
+
+        teacher_rows = list(
+            range(
+                row_start,
+                min(row_start + row_len, int(teacher_topk_logits.shape[1])),
+            )
+        )
+        copy_len = min(len(student_row_positions), len(teacher_rows))
+        if copy_len <= 0:
+            continue
+
+        rows_student = student_row_positions[:copy_len]
+        rows_teacher = teacher_rows[:copy_len]
+        aligned_logits[b, rows_student, :] = teacher_topk_logits[b, rows_teacher, :]
+        aligned_indices[b, rows_student, :] = teacher_topk_indices[b, rows_teacher, :]
+
+        # Convert row positions back to token positions for token-level masking.
+        aligned_token_positions = [row + 1 for row in rows_student]
+        aligned_token_mask[b, aligned_token_positions] = 1
+
+    return aligned_logits, aligned_indices, aligned_token_mask
+
+
 def distillation_train(
     student_policy: ColocatablePolicyInterface,
     teacher_policy: ColocatablePolicyInterface,
@@ -547,6 +816,12 @@ def distillation_train(
     val_period = master_config["distillation"]["val_period"]
     val_at_start = master_config["distillation"]["val_at_start"]
     val_at_end = master_config["distillation"]["val_at_end"]
+    use_environment_rollout = master_config["distillation"].get(
+        "use_environment_rollout", True
+    )
+    teacher_prompt_template = master_config["distillation"].get(
+        "teacher_prompt_template"
+    )
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
     max_epochs = master_config["distillation"][
         "max_num_epochs"
@@ -625,37 +900,45 @@ def distillation_train(
                         student_generation.prepare_for_generation()
 
                 with timer.time("generation"):
-                    # Use async rollouts if vLLM async engine is enabled
-                    if _should_use_async_rollouts(master_config):
-                        (
-                            repeated_batch,
-                            rollout_metrics,
-                        ) = run_async_multi_turn_rollout(
-                            policy_generation=student_generation,
-                            input_batch=repeated_batch,
-                            tokenizer=tokenizer,
-                            task_to_env=task_to_env,
-                            max_seq_len=master_config["policy"][
-                                "max_total_sequence_length"
-                            ],
-                            max_rollout_turns=master_config["distillation"][
-                                "max_rollout_turns"
-                            ],
-                            greedy=False,
-                        )
+                    if use_environment_rollout:
+                        # Use async rollouts if vLLM async engine is enabled
+                        if _should_use_async_rollouts(master_config):
+                            (
+                                repeated_batch,
+                                rollout_metrics,
+                            ) = run_async_multi_turn_rollout(
+                                policy_generation=student_generation,
+                                input_batch=repeated_batch,
+                                tokenizer=tokenizer,
+                                task_to_env=task_to_env,
+                                max_seq_len=master_config["policy"][
+                                    "max_total_sequence_length"
+                                ],
+                                max_rollout_turns=master_config["distillation"][
+                                    "max_rollout_turns"
+                                ],
+                                greedy=False,
+                            )
+                        else:
+                            repeated_batch, rollout_metrics = run_multi_turn_rollout(
+                                policy_generation=student_generation,
+                                input_batch=repeated_batch,
+                                tokenizer=tokenizer,
+                                task_to_env=task_to_env,
+                                max_seq_len=master_config["policy"][
+                                    "max_total_sequence_length"
+                                ],
+                                max_rollout_turns=master_config["distillation"][
+                                    "max_rollout_turns"
+                                ],
+                                greedy=False,
+                            )
                     else:
-                        repeated_batch, rollout_metrics = run_multi_turn_rollout(
+                        repeated_batch, rollout_metrics = _run_generation_only_rollout(
                             policy_generation=student_generation,
                             input_batch=repeated_batch,
                             tokenizer=tokenizer,
-                            task_to_env=task_to_env,
-                            max_seq_len=master_config["policy"][
-                                "max_total_sequence_length"
-                            ],
-                            max_rollout_turns=master_config["distillation"][
-                                "max_rollout_turns"
-                            ],
-                            greedy=False,
+                            master_config=master_config,
                         )
                     student_generation.finish_generation()
 
@@ -702,13 +985,41 @@ def distillation_train(
 
                 print("▶ Computing teacher logprobs...", flush=True)
                 with timer.time("teacher_logprob_inference"):
-                    teacher_topk = teacher_policy.get_topk_logits(
-                        train_data,
-                        k=master_config["distillation"]["topk_logits_k"],
-                        timer=timer,
-                    )
-                    train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
-                    train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
+                    if teacher_prompt_template:
+                        (
+                            teacher_data,
+                            teacher_solution_row_ranges,
+                        ) = _build_teacher_conditioned_data(
+                            repeated_batch=repeated_batch,
+                            tokenizer=tokenizer,
+                            master_config=master_config,
+                        )
+                        teacher_topk = teacher_policy.get_topk_logits(
+                            teacher_data,
+                            k=master_config["distillation"]["topk_logits_k"],
+                            timer=timer,
+                        )
+                        (
+                            aligned_topk_logits,
+                            aligned_topk_indices,
+                            aligned_token_mask,
+                        ) = _align_teacher_topk_to_student(
+                            teacher_topk_logits=teacher_topk["topk_logits"],
+                            teacher_topk_indices=teacher_topk["topk_indices"],
+                            student_token_mask=train_data["token_mask"],
+                            teacher_solution_row_ranges=teacher_solution_row_ranges,
+                        )
+                        train_data["teacher_topk_logits"] = aligned_topk_logits.cpu()
+                        train_data["teacher_topk_indices"] = aligned_topk_indices.cpu()
+                        train_data["token_mask"] = aligned_token_mask.cpu()
+                    else:
+                        teacher_topk = teacher_policy.get_topk_logits(
+                            train_data,
+                            k=master_config["distillation"]["topk_logits_k"],
+                            timer=timer,
+                        )
+                        train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
+                        train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
 
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):

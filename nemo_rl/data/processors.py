@@ -34,6 +34,14 @@ from nemo_rl.data.llm_message_utils import get_formatted_message_log
 TokenizerType = PreTrainedTokenizerBase
 
 
+def _format_problem_prompt(template: str, problem: str) -> str:
+    """Format prompt supporting both '{}' and '{problem}' placeholders."""
+    try:
+        return template.format(problem=problem)
+    except (KeyError, IndexError):
+        return template.format(problem)
+
+
 def helpsteer3_data_processor(
     datum_dict: dict[str, Any],
     task_data_spec: TaskDataSpec,
@@ -344,7 +352,7 @@ def math_data_processor(
 
     # user prompt
     if task_data_spec.prompt:
-        problem = task_data_spec.prompt.format(problem)
+        problem = _format_problem_prompt(task_data_spec.prompt, problem)
     user_message = {"role": "user", "content": problem}
     message = tokenizer.apply_chat_template(
         [user_message],
@@ -395,7 +403,9 @@ def math_hf_data_processor(
 
     message_log: LLMMessageLogType = []
     formatted_content = (
-        task_data_spec.prompt.format(problem) if task_data_spec.prompt else problem
+        _format_problem_prompt(task_data_spec.prompt, problem)
+        if task_data_spec.prompt
+        else problem
     )
     user_message = {
         "role": "user",
@@ -493,14 +503,20 @@ def vlm_hf_data_processor(
                 user_message["content"].append(
                     {
                         "type": "text",
-                        "text": task_data_spec.prompt.format(content["text"])
+                        "text": _format_problem_prompt(
+                            task_data_spec.prompt, content["text"]
+                        )
                         if task_data_spec.prompt
                         else content["text"],
                     }
                 )
     else:
         # conversation consists of a text-only message
-        user_message["content"] = task_data_spec.prompt.format(problem)
+        user_message["content"] = (
+            _format_problem_prompt(task_data_spec.prompt, problem)
+            if task_data_spec.prompt
+            else problem
+        )
 
     images = [resolve_to_image(image) for image in images]
 
