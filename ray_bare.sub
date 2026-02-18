@@ -1,0 +1,218 @@
+#!/bin/bash
+#SBATCH --job-name=nemo-rl-bare
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=32
+#SBATCH --time=01:00:00
+#SBATCH --output=%x-%j.out
+#SBATCH --partition=develbooster
+#SBATCH --account=envcomp
+
+set -euo pipefail
+
+NEMO_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
+VENV="$NEMO_DIR/.venv"
+RAY_BIN="$VENV/bin/ray"
+PY_BIN="$VENV/bin/python"
+
+BASE_LOG_DIR="${BASE_LOG_DIR:-${SLURM_SUBMIT_DIR:-$PWD}}"
+LOG_DIR="$BASE_LOG_DIR/$SLURM_JOB_ID-logs"
+mkdir -p "$LOG_DIR"
+
+GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
+CPUS_PER_WORKER="${CPUS_PER_WORKER:-$SLURM_CPUS_PER_TASK}"
+
+RAY_PORT="${RAY_PORT:-$((6379 + SLURM_JOB_ID % 1000))}"
+RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-$((8265 + SLURM_JOB_ID % 1000))}"
+
+if [[ ! -x "$RAY_BIN" ]]; then
+  echo "ERROR: ray binary not found at $RAY_BIN"
+  exit 1
+fi
+
+if [[ ! -x "$PY_BIN" ]]; then
+  echo "ERROR: python binary not found at $PY_BIN"
+  exit 1
+fi
+
+cd "$NEMO_DIR"
+
+# Avoid inherited module state from login shell (can cause ABI mismatches).
+module --force purge
+module load Stages/2026
+module load CUDA
+module unload cuDNN >/dev/null 2>&1 || true
+if ! module load NCCL >/dev/null 2>&1; then
+  echo "[WARN] Could not load NCCL module; continuing without it."
+fi
+
+# Do not load cluster cuDNN in bare-metal mode: worker venvs ship their own
+# nvidia-cudnn-cu12 wheels, and mixing both stacks can break TE imports.
+if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+  filtered_ld_library_path=""
+  IFS=':' read -r -a ld_parts <<< "$LD_LIBRARY_PATH"
+  for part in "${ld_parts[@]}"; do
+    if [[ "$part" == *cuDNN* || "$part" == *cudnn* ]]; then
+      continue
+    fi
+    filtered_ld_library_path="${filtered_ld_library_path:+$filtered_ld_library_path:}$part"
+  done
+  export LD_LIBRARY_PATH="$filtered_ld_library_path"
+fi
+export UV_PROJECT_ENVIRONMENT="$VENV"
+export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
+
+# Default to offline Hugging Face usage on compute nodes.
+# Can be overridden at submit time, e.g. HF_HUB_OFFLINE=0 sbatch ...
+export HF_HOME="${HF_HOME:-/p/project1/envcomp/yll/.cache/huggingface}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$HF_HOME/datasets}"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
+export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
+
+nodes=($(scontrol show hostnames "$SLURM_JOB_NODELIST"))
+head_node="${nodes[0]}"
+head_addr=""
+declare -a SRUN_PIDS=()
+TERMINATION_SIGNAL=""
+DRIVER_RC=""
+
+cleanup() {
+  local rc=$?
+  set +e
+  if [[ -n "${TERMINATION_SIGNAL:-}" ]]; then
+    echo "[ERROR] Received $TERMINATION_SIGNAL (possible time limit or manual cancellation)."
+  fi
+  if [[ -n "${DRIVER_RC:-}" ]]; then
+    echo "[INFO] Driver step exit code: $DRIVER_RC"
+  fi
+  echo "[INFO] Cleaning up Ray processes..."
+  for pid in "${SRUN_PIDS[@]:-}"; do
+    kill "$pid" >/dev/null 2>&1 || true
+  done
+  if [[ -n "${head_addr:-}" ]]; then
+    "$RAY_BIN" stop --address "$head_addr" >/dev/null 2>&1 || true
+  fi
+  for node in "${nodes[@]:-}"; do
+    srun --overlap -N1 -n1 -w "$node" "$RAY_BIN" stop --force >/dev/null 2>&1 || true
+  done
+  return "$rc"
+}
+
+on_sigint() {
+  TERMINATION_SIGNAL="SIGINT"
+  exit 130
+}
+
+on_sigterm() {
+  TERMINATION_SIGNAL="SIGTERM"
+  exit 143
+}
+
+trap cleanup EXIT
+trap on_sigint INT
+trap on_sigterm TERM
+
+echo "[INFO] Head node: $head_node"
+echo "[INFO] All nodes: ${nodes[*]}"
+
+head_ip=$(srun -N1 -n1 -w "$head_node" hostname -I | awk '{print $1}')
+head_addr="$head_ip:$RAY_PORT"
+echo "[INFO] Head IP: $head_ip"
+
+echo "[INFO] Starting Ray head on $head_node"
+srun --overlap -N1 -n1 -w "$head_node" -o "$LOG_DIR/ray-head.log" \
+  "$RAY_BIN" start --head \
+  --node-ip-address="$head_ip" \
+  --port="$RAY_PORT" \
+  --dashboard-port="$RAY_DASHBOARD_PORT" \
+  --dashboard-host=0.0.0.0 \
+  --num-cpus="$CPUS_PER_WORKER" \
+  --num-gpus="$GPUS_PER_NODE" \
+  --resources="{\"worker_units\": $GPUS_PER_NODE, \"slurm_managed_ray_cluster\": 1}" \
+  --disable-usage-stats \
+  --block &
+SRUN_PIDS+=($!)
+
+sleep 10
+if ! kill -0 "${SRUN_PIDS[0]}" >/dev/null 2>&1; then
+  echo "[ERROR] Ray head step exited before cluster became ready. Check $LOG_DIR/ray-head.log"
+  exit 1
+fi
+
+for ((i = 1; i < ${#nodes[@]}; i++)); do
+  worker="${nodes[$i]}"
+  echo "[INFO] Starting Ray worker on $worker"
+  srun --overlap -N1 -n1 -w "$worker" -o "$LOG_DIR/ray-worker-$i.log" \
+    "$RAY_BIN" start \
+    --address "$head_addr" \
+    --num-cpus="$CPUS_PER_WORKER" \
+    --num-gpus="$GPUS_PER_NODE" \
+    --resources="{\"worker_units\": $GPUS_PER_NODE, \"slurm_managed_ray_cluster\": 1}" \
+    --disable-usage-stats \
+    --block &
+  SRUN_PIDS+=($!)
+  sleep 2
+done
+
+extract_worker_units() {
+  local status_output
+  status_output="$(srun --overlap -N1 -n1 -w "$head_node" "$RAY_BIN" status --address "$head_addr" 2>&1 || true)"
+
+  # Keep raw probe output to aid debugging when polling fails early.
+  if [[ -n "$status_output" ]]; then
+    printf '%s\n' "$status_output" >> "$LOG_DIR/ray-status.log"
+  fi
+
+  awk '
+      /worker_units/ {
+        if (match($0, /[0-9]+(\.[0-9]+)?\/[0-9]+(\.[0-9]+)?/)) {
+          split(substr($0, RSTART, RLENGTH), a, "/");
+          # ray status prints resources as used/total; readiness needs total available.
+          print int(a[2] + 0);
+          found = 1;
+          exit
+        }
+      }
+      END {
+        if (!found) print 0
+      }' <<< "$status_output"
+}
+
+EXPECTED_WORKER_UNITS=$((GPUS_PER_NODE * SLURM_JOB_NUM_NODES))
+echo "[INFO] Waiting for worker_units=$EXPECTED_WORKER_UNITS to become available..."
+for attempt in $(seq 1 60); do
+  ACTIVE_WORKER_UNITS="$(extract_worker_units)"
+  echo "[INFO] [$attempt/60] worker_units: $ACTIVE_WORKER_UNITS/$EXPECTED_WORKER_UNITS"
+  if [[ "$ACTIVE_WORKER_UNITS" -eq "$EXPECTED_WORKER_UNITS" ]]; then
+    echo "[INFO] All workers connected!"
+    break
+  fi
+  if [[ "$attempt" -eq 60 ]]; then
+    echo "[ERROR] Timed out waiting for Ray workers."
+    exit 1
+  fi
+  sleep 5
+done
+
+CKPT_DIR="${CKPT_DIR:-$NEMO_DIR/results/distill_${SLURM_JOB_NUM_NODES}nodes_${GPUS_PER_NODE}gpn}"
+DEFAULT_CONFIG="${DISTILL_CONFIG:-examples/configs/distillation_math.yaml}"
+
+if [[ -n "${COMMAND:-}" ]]; then
+  DRIVER_COMMAND="$COMMAND"
+else
+  DRIVER_COMMAND="uv run python examples/run_distillation.py --config $DEFAULT_CONFIG cluster.num_nodes=$SLURM_JOB_NUM_NODES cluster.gpus_per_node=$GPUS_PER_NODE checkpointing.checkpoint_dir=$CKPT_DIR"
+fi
+
+echo "[INFO] Running driver command on $head_node"
+echo "[INFO] COMMAND: $DRIVER_COMMAND"
+set +e
+srun --overlap -N1 -n1 -w "$head_node" -o "$LOG_DIR/ray-driver.log" \
+  bash -lc "cd '$NEMO_DIR' && $DRIVER_COMMAND"
+DRIVER_RC=$?
+set -e
+
+if [[ "$DRIVER_RC" -ne 0 ]]; then
+  echo "[ERROR] Driver command failed with exit code $DRIVER_RC. Check $LOG_DIR/ray-driver.log"
+fi
+exit "$DRIVER_RC"

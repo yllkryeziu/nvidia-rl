@@ -30,7 +30,7 @@ checkpointing:
     save_consolidated: false
 
 policy: &POLICY_BASE
-    model_name: "Qwen/Qwen3-1.7B-Base"
+    model_name: "Qwen/Qwen3-0.6B"
     tokenizer:
         name: ${..model_name} ## specify if you'd like to use a tokenizer different from the model's default
         chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
@@ -199,20 +199,20 @@ policy: &POLICY_BASE
         colocated:
             # true: generation shares training GPUs
             # false: uses dedicated generation resources
-            enabled: true
+            enabled: false
             # only relevant when enabled is false
             resources:
-                gpus_per_node: null # Decides num gpus to be dedicated to generation when there is one node in the cluster i.e cluster.num_nodes == 1
-                num_nodes: null # Decides number of nodes to be dedicated to generation
+                gpus_per_node: 4 # Decides num gpus to be dedicated to generation when there is one node in the cluster i.e cluster.num_nodes == 1
+                num_nodes: 1 # Decides number of nodes to be dedicated to generation
 
 
 teacher:
     <<: *POLICY_BASE
-    model_name: "Qwen/Qwen3-4B"
+    model_name: "Qwen/Qwen3-0.6B"
     dtensor_cfg:
         <<: *DTENSOR_BASE
         context_parallel_size: 2 
-        tensor_parallel_size: 4
+        tensor_parallel_size: 2
 
 data:
     max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
