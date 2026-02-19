@@ -590,6 +590,293 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch):
         assert isinstance(result, tuple)
 
 
+def test_distillation_setup_resource_isolation_smoke(monkeypatch):
+    import nemo_rl.algorithms.distillation as distil_mod
+
+    master_config = {
+        "policy": {
+            "generation": {
+                "backend": "vllm",
+                "colocated": {
+                    "enabled": False,
+                    "resources": {
+                        "gpus_per_node": 8,
+                        "num_nodes": 1,
+                    },
+                },
+            },
+            "dtensor_cfg": {
+                "enabled": False,
+            },
+            "model_name": "test-policy",
+        },
+        "teacher": {
+            "model_name": "test-teacher",
+            "dtensor_cfg": {
+                "enabled": False,
+            },
+        },
+        "loss_fn": {
+            "kl_type": "forward",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,
+        },
+        "distillation": {
+            "seed": 42,
+            "topk_logits_k": 64,
+            "num_prompts_per_step": 1,
+            "max_num_epochs": 10,
+            "max_num_steps": 100,
+            "val_period": 0,
+            "val_at_start": False,
+            "val_at_end": False,
+            "resource_isolation": {
+                "enabled": True,
+                "teacher_resident_on_gpu": True,
+                "roles": {
+                    "training": {"num_nodes": 1, "gpus_per_node": 8},
+                    "generation": {"num_nodes": 1, "gpus_per_node": 8},
+                    "teacher": {"num_nodes": 1, "gpus_per_node": 8},
+                },
+            },
+        },
+        "data": {"shuffle": False},
+        "logger": {},
+        "checkpointing": {},
+        "cluster": {"num_nodes": 3, "gpus_per_node": 8},
+    }
+
+    tokenizer = MagicMock()
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=1)
+    monkeypatch.setenv("NRL_SKIP_DISTILLATION_TOKENIZER_CHECK", "1")
+
+    created_clusters = []
+    created_policies = []
+    created_generations = []
+
+    class DummyCluster:
+        def __init__(self, *args, **kwargs):
+            self.name = kwargs.get("name", "")
+            self.bundle_ct_per_node_list = kwargs["bundle_ct_per_node_list"]
+            created_clusters.append(self)
+
+        def world_size(self):
+            return sum(self.bundle_ct_per_node_list)
+
+        def get_master_address_and_port(self):
+            return "127.0.0.1", 12345
+
+    class DummyPolicy:
+        def __init__(self, *args, **kwargs):
+            self.name_prefix = kwargs["name_prefix"]
+            self.cluster = kwargs["cluster"]
+            created_policies.append(self)
+
+        def prepare_refit_info(self):
+            return {}
+
+        def offload_after_refit(self):
+            return None
+
+        def init_collective(self, *args, **kwargs):
+            return [MagicMock()]
+
+    class DummyVllmGeneration:
+        def __init__(self, *args, **kwargs):
+            self.cluster = kwargs["cluster"]
+            created_generations.append(self)
+
+        def finish_generation(self):
+            return None
+
+        def prepare_refit_info(self, *args, **kwargs):
+            return None
+
+        def init_collective(self, *args, **kwargs):
+            return [MagicMock()]
+
+    with (
+        patch.object(distil_mod, "RayVirtualCluster", DummyCluster),
+        patch.object(distil_mod, "Logger"),
+        patch.object(distil_mod, "CheckpointManager") as mock_ckpt_mgr,
+        patch.object(distil_mod, "StatefulDataLoader"),
+        patch.object(distil_mod, "Policy", DummyPolicy),
+        patch.object(distil_mod, "VllmGeneration", DummyVllmGeneration),
+        patch.object(distil_mod, "ray") as mock_ray,
+    ):
+        mock_ckpt_mgr.return_value.get_latest_checkpoint_path.return_value = None
+        mock_ray.get = MagicMock(return_value=None)
+        distil_mod.setup(master_config, tokenizer, dataset, None)
+
+    assert {cluster.name for cluster in created_clusters} == {
+        "distillation_train_cluster",
+        "distillation_inference_cluster",
+        "distillation_teacher_cluster",
+    }
+    student_policy = next(p for p in created_policies if p.name_prefix == "student")
+    teacher_policy = next(p for p in created_policies if p.name_prefix == "teacher")
+    assert student_policy.cluster.name == "distillation_train_cluster"
+    assert teacher_policy.cluster.name == "distillation_teacher_cluster"
+    assert created_generations[0].cluster.name == "distillation_inference_cluster"
+
+
+def test_resource_isolation_fails_on_invalid_node_partition():
+    from nemo_rl.algorithms.distillation import setup
+
+    master_config = {
+        "policy": {
+            "model_name": "student",
+            "generation": {
+                "backend": "vllm",
+                "colocated": {"enabled": False, "resources": {"gpus_per_node": 8, "num_nodes": 1}},
+            },
+            "dtensor_cfg": {"enabled": False},
+        },
+        "teacher": {"model_name": "teacher", "dtensor_cfg": {"enabled": False}},
+        "loss_fn": {},
+        "distillation": {
+            "seed": 42,
+            "topk_logits_k": 64,
+            "num_prompts_per_step": 1,
+            "max_num_epochs": 1,
+            "max_num_steps": 1,
+            "val_period": 0,
+            "val_at_start": False,
+            "val_at_end": False,
+            "resource_isolation": {
+                "enabled": True,
+                "roles": {
+                    "training": {"num_nodes": 1, "gpus_per_node": 8},
+                    "generation": {"num_nodes": 1, "gpus_per_node": 8},
+                    "teacher": {"num_nodes": 1, "gpus_per_node": 8},
+                },
+            },
+        },
+        "data": {"shuffle": False},
+        "logger": {},
+        "checkpointing": {},
+        "cluster": {"num_nodes": 2, "gpus_per_node": 8},
+    }
+    tokenizer = MagicMock()
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=10)
+
+    with pytest.raises(AssertionError, match="must exactly partition cluster nodes"):
+        with (
+            patch("nemo_rl.algorithms.distillation.Logger"),
+            patch("nemo_rl.algorithms.distillation.CheckpointManager") as mock_ckpt_mgr,
+            patch("nemo_rl.algorithms.distillation.StatefulDataLoader"),
+        ):
+            mock_ckpt_mgr.return_value.get_latest_checkpoint_path.return_value = None
+            setup(master_config, tokenizer, dataset, None)
+
+
+def test_resource_isolation_fails_on_invalid_gpus_per_node():
+    from nemo_rl.algorithms.distillation import setup
+
+    master_config = {
+        "policy": {
+            "model_name": "student",
+            "generation": {
+                "backend": "vllm",
+                "colocated": {"enabled": False, "resources": {"gpus_per_node": 8, "num_nodes": 1}},
+            },
+            "dtensor_cfg": {"enabled": False},
+        },
+        "teacher": {"model_name": "teacher", "dtensor_cfg": {"enabled": False}},
+        "loss_fn": {},
+        "distillation": {
+            "seed": 42,
+            "topk_logits_k": 64,
+            "num_prompts_per_step": 1,
+            "max_num_epochs": 1,
+            "max_num_steps": 1,
+            "val_period": 0,
+            "val_at_start": False,
+            "val_at_end": False,
+            "resource_isolation": {
+                "enabled": True,
+                "roles": {
+                    "training": {"num_nodes": 1, "gpus_per_node": 4},
+                    "generation": {"num_nodes": 1, "gpus_per_node": 8},
+                    "teacher": {"num_nodes": 1, "gpus_per_node": 8},
+                },
+            },
+        },
+        "data": {"shuffle": False},
+        "logger": {},
+        "checkpointing": {},
+        "cluster": {"num_nodes": 3, "gpus_per_node": 8},
+    }
+    tokenizer = MagicMock()
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=10)
+
+    with pytest.raises(AssertionError, match="enforces node-level role isolation"):
+        with (
+            patch("nemo_rl.algorithms.distillation.Logger"),
+            patch("nemo_rl.algorithms.distillation.CheckpointManager") as mock_ckpt_mgr,
+            patch("nemo_rl.algorithms.distillation.StatefulDataLoader"),
+        ):
+            mock_ckpt_mgr.return_value.get_latest_checkpoint_path.return_value = None
+            setup(master_config, tokenizer, dataset, None)
+
+
+def test_resource_isolation_requires_non_colocated_generation():
+    from nemo_rl.algorithms.distillation import setup
+
+    master_config = {
+        "policy": {
+            "model_name": "student",
+            "generation": {
+                "backend": "vllm",
+                "colocated": {"enabled": True, "resources": {"gpus_per_node": 8, "num_nodes": 1}},
+            },
+            "dtensor_cfg": {"enabled": False},
+        },
+        "teacher": {"model_name": "teacher", "dtensor_cfg": {"enabled": False}},
+        "loss_fn": {},
+        "distillation": {
+            "seed": 42,
+            "topk_logits_k": 64,
+            "num_prompts_per_step": 1,
+            "max_num_epochs": 1,
+            "max_num_steps": 1,
+            "val_period": 0,
+            "val_at_start": False,
+            "val_at_end": False,
+            "resource_isolation": {
+                "enabled": True,
+                "roles": {
+                    "training": {"num_nodes": 1, "gpus_per_node": 8},
+                    "generation": {"num_nodes": 1, "gpus_per_node": 8},
+                    "teacher": {"num_nodes": 1, "gpus_per_node": 8},
+                },
+            },
+        },
+        "data": {"shuffle": False},
+        "logger": {},
+        "checkpointing": {},
+        "cluster": {"num_nodes": 3, "gpus_per_node": 8},
+    }
+    tokenizer = MagicMock()
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=10)
+
+    with pytest.raises(
+        AssertionError,
+        match="requires policy.generation.colocated.enabled=false",
+    ):
+        with (
+            patch("nemo_rl.algorithms.distillation.Logger"),
+            patch("nemo_rl.algorithms.distillation.CheckpointManager") as mock_ckpt_mgr,
+            patch("nemo_rl.algorithms.distillation.StatefulDataLoader"),
+        ):
+            mock_ckpt_mgr.return_value.get_latest_checkpoint_path.return_value = None
+            setup(master_config, tokenizer, dataset, None)
+
+
 def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
     """Test that non-colocated inference requires explicit gpus_per_node when cluster.num_nodes>1."""
     from unittest.mock import MagicMock, patch
@@ -739,3 +1026,61 @@ def test_context_distillation_requires_single_turn_rollouts():
         match="supports single-turn rollouts only",
     ):
         setup(master_config, tokenizer, dataset, None)
+
+
+def test_distillation_train_teacher_resident_mode_calls_prepare_once(mock_components):
+    mock_components["master_config"]["distillation"]["max_num_steps"] = 3
+    mock_components["master_config"]["distillation"]["resource_isolation"] = {
+        "enabled": True,
+        "teacher_resident_on_gpu": True,
+    }
+    distillation_save_state = _default_distillation_save_state()
+
+    distillation_train(
+        mock_components["student_policy"],
+        mock_components["teacher_policy"],
+        mock_components["student_generation"],
+        mock_components["train_dataloader"],
+        mock_components["val_dataloader"],
+        mock_components["tokenizer"],
+        mock_components["loss_fn"],
+        mock_components["task_to_env"],
+        mock_components["val_task_to_env"],
+        mock_components["logger"],
+        mock_components["checkpointer"],
+        distillation_save_state,
+        mock_components["master_config"],
+    )
+
+    assert mock_components["teacher_policy"].prepare_for_lp_inference.call_count == 1
+    assert mock_components["teacher_policy"].offload_after_refit.call_count == 1
+
+
+def test_distillation_train_teacher_nonresident_mode_preserves_step_toggling(
+    mock_components,
+):
+    mock_components["master_config"]["distillation"]["max_num_steps"] = 3
+    mock_components["master_config"]["distillation"]["resource_isolation"] = {
+        "enabled": True,
+        "teacher_resident_on_gpu": False,
+    }
+    distillation_save_state = _default_distillation_save_state()
+
+    distillation_train(
+        mock_components["student_policy"],
+        mock_components["teacher_policy"],
+        mock_components["student_generation"],
+        mock_components["train_dataloader"],
+        mock_components["val_dataloader"],
+        mock_components["tokenizer"],
+        mock_components["loss_fn"],
+        mock_components["task_to_env"],
+        mock_components["val_task_to_env"],
+        mock_components["logger"],
+        mock_components["checkpointer"],
+        distillation_save_state,
+        mock_components["master_config"],
+    )
+
+    assert mock_components["teacher_policy"].prepare_for_lp_inference.call_count == 3
+    assert mock_components["teacher_policy"].offload_after_refit.call_count == 3

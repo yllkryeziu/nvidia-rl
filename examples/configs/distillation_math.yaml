@@ -26,6 +26,19 @@ distillation:
             missing_trace_policy: "empty"
         metrics:
             enabled: true
+    resource_isolation:
+        enabled: false
+        teacher_resident_on_gpu: true
+        roles:
+            training:
+                num_nodes: 1
+                gpus_per_node: 8
+            generation:
+                num_nodes: 1
+                gpus_per_node: 8
+            teacher:
+                num_nodes: 1
+                gpus_per_node: 8
 
 loss_fn:
     kl_type: "mixed" # forward, reverse, mixed

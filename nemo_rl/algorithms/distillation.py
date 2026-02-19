@@ -96,6 +96,23 @@ class ContextDistillationConfig(TypedDict):
     metrics: ContextDistillationMetricsConfig
 
 
+class DistillationRoleResourcesConfig(TypedDict):
+    num_nodes: int
+    gpus_per_node: int
+
+
+class DistillationResourceIsolationRolesConfig(TypedDict):
+    training: DistillationRoleResourcesConfig
+    generation: DistillationRoleResourcesConfig
+    teacher: DistillationRoleResourcesConfig
+
+
+class DistillationResourceIsolationConfig(TypedDict):
+    enabled: bool
+    roles: DistillationResourceIsolationRolesConfig
+    teacher_resident_on_gpu: NotRequired[bool]
+
+
 class DistillationConfig(TypedDict):
     # Training configuration
     num_prompts_per_step: int
@@ -113,6 +130,7 @@ class DistillationConfig(TypedDict):
     topk_logits_k: int
     seed: int
     context_distillation: NotRequired[ContextDistillationConfig]
+    resource_isolation: NotRequired[DistillationResourceIsolationConfig]
 
 
 class DistillationSaveState(TypedDict):
@@ -135,6 +153,59 @@ def _default_distillation_save_state() -> DistillationSaveState:
         "consumed_samples": 0,
         "total_valid_tokens": 0,
     }
+
+
+def _validate_resource_isolation_cfg(
+    resource_isolation_cfg: DistillationResourceIsolationConfig,
+    cluster_config: ClusterConfig,
+    generation_config: dict[str, Any],
+) -> DistillationResourceIsolationRolesConfig:
+    assert generation_config["backend"] == "vllm", (
+        "distillation.resource_isolation currently supports vLLM generation only. "
+        f"Got policy.generation.backend={generation_config['backend']}."
+    )
+    assert not generation_config["colocated"]["enabled"], (
+        "distillation.resource_isolation requires policy.generation.colocated.enabled=false."
+    )
+
+    roles = resource_isolation_cfg.get("roles")
+    assert roles is not None, (
+        "distillation.resource_isolation.roles must be set with training, generation, and teacher entries."
+    )
+
+    cluster_nodes = cluster_config["num_nodes"]
+    cluster_gpus_per_node = cluster_config["gpus_per_node"]
+
+    role_names = ("training", "generation", "teacher")
+    total_role_nodes = 0
+    for role_name in role_names:
+        role_cfg = roles.get(role_name)
+        assert role_cfg is not None, (
+            f"distillation.resource_isolation.roles.{role_name} must be provided."
+        )
+        role_nodes = role_cfg.get("num_nodes")
+        role_gpus = role_cfg.get("gpus_per_node")
+        assert isinstance(role_nodes, int) and role_nodes > 0, (
+            "distillation.resource_isolation.roles."
+            f"{role_name}.num_nodes must be a positive integer, got {role_nodes}."
+        )
+        assert isinstance(role_gpus, int) and role_gpus > 0, (
+            "distillation.resource_isolation.roles."
+            f"{role_name}.gpus_per_node must be a positive integer, got {role_gpus}."
+        )
+        assert role_gpus == cluster_gpus_per_node, (
+            "distillation.resource_isolation enforces node-level role isolation. "
+            "Set distillation.resource_isolation.roles."
+            f"{role_name}.gpus_per_node={cluster_gpus_per_node} to match cluster.gpus_per_node, got {role_gpus}."
+        )
+        total_role_nodes += role_nodes
+
+    assert total_role_nodes == cluster_nodes, (
+        "distillation.resource_isolation role nodes must exactly partition cluster nodes. "
+        f"Expected sum(role.num_nodes)={cluster_nodes}, got {total_role_nodes}. "
+        "Check distillation.resource_isolation.roles.*.num_nodes and cluster.num_nodes."
+    )
+    return roles
 
 
 class MasterConfig(TypedDict):
@@ -215,6 +286,13 @@ def setup(
     data_config = master_config["data"]
     logger_config = master_config["logger"]
     cluster_config = master_config["cluster"]
+    resource_isolation_cfg = distillation_config.get("resource_isolation")
+    resource_isolation_enabled = bool(
+        resource_isolation_cfg and resource_isolation_cfg.get("enabled", False)
+    )
+    teacher_resident_on_gpu = bool(
+        resource_isolation_cfg.get("teacher_resident_on_gpu", True)
+    ) if resource_isolation_enabled else False
 
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for distillation"
@@ -345,8 +423,55 @@ def setup(
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
+    inference_nodes = 0
+    inference_gpus_per_node = 0
 
-    if colocated_inference:
+    if resource_isolation_enabled:
+        assert resource_isolation_cfg is not None
+        roles = _validate_resource_isolation_cfg(
+            resource_isolation_cfg=resource_isolation_cfg,
+            cluster_config=cluster_config,
+            generation_config=generation_config,
+        )
+        training_role = roles["training"]
+        generation_role = roles["generation"]
+        teacher_role = roles["teacher"]
+        inference_nodes = generation_role["num_nodes"]
+        inference_gpus_per_node = generation_role["gpus_per_node"]
+
+        train_cluster = RayVirtualCluster(
+            name="distillation_train_cluster",
+            bundle_ct_per_node_list=[training_role["gpus_per_node"]]
+            * training_role["num_nodes"],
+            use_gpus=True,
+            num_gpus_per_node=training_role["gpus_per_node"],
+            max_colocated_worker_groups=3,
+        )
+        inference_cluster = RayVirtualCluster(
+            name="distillation_inference_cluster",
+            bundle_ct_per_node_list=[generation_role["gpus_per_node"]]
+            * generation_role["num_nodes"],
+            use_gpus=True,
+            num_gpus_per_node=generation_role["gpus_per_node"],
+            max_colocated_worker_groups=3,
+        )
+        teacher_cluster = RayVirtualCluster(
+            name="distillation_teacher_cluster",
+            bundle_ct_per_node_list=[teacher_role["gpus_per_node"]]
+            * teacher_role["num_nodes"],
+            use_gpus=True,
+            num_gpus_per_node=teacher_role["gpus_per_node"],
+            max_colocated_worker_groups=1,
+        )
+        print(
+            "  ✓ Isolated clusters created: "
+            f"train={training_role['num_nodes']}x{training_role['gpus_per_node']}GPUs, "
+            f"inference={generation_role['num_nodes']}x{generation_role['gpus_per_node']}GPUs, "
+            f"teacher={teacher_role['num_nodes']}x{teacher_role['gpus_per_node']}GPUs, "
+            f"teacher_resident_on_gpu={teacher_resident_on_gpu}",
+            flush=True,
+        )
+    elif colocated_inference:
         cluster = RayVirtualCluster(
             name="distillation_cluster",
             bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
@@ -359,6 +484,7 @@ def setup(
         )
         train_cluster = cluster
         inference_cluster = cluster
+        teacher_cluster = cluster
         print(
             f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes",
             flush=True,
@@ -424,6 +550,7 @@ def setup(
             num_gpus_per_node=inference_gpus_per_node,
             max_colocated_worker_groups=3,
         )
+        teacher_cluster = train_cluster
         print(
             f"  ✓ Separate clusters created: train={train_nodes}x{train_gpus_per_node}GPUs, inference={inference_nodes}x{inference_gpus_per_node}GPUs",
             flush=True,
@@ -452,7 +579,7 @@ def setup(
 
     teacher_policy = Policy(
         name_prefix="teacher",
-        cluster=train_cluster,
+        cluster=teacher_cluster,
         config=teacher_config,
         tokenizer=tokenizer,
         weights_path=weights_path,
@@ -460,7 +587,13 @@ def setup(
         init_optimizer=False,
         init_reference_model=False,
     )
-    teacher_policy.offload_after_refit()
+    if not teacher_resident_on_gpu:
+        teacher_policy.offload_after_refit()
+    else:
+        print(
+            "  ✓ Teacher will remain resident on GPU between distillation steps.",
+            flush=True,
+        )
 
     # ==========================
     #    Student Generation Interface
@@ -632,6 +765,12 @@ def distillation_train(
         "max_total_sequence_length",
         master_config["policy"]["max_total_sequence_length"],
     )
+    resource_isolation_cfg = master_config["distillation"].get("resource_isolation")
+    teacher_should_stay_resident = bool(
+        resource_isolation_cfg
+        and resource_isolation_cfg.get("enabled", False)
+        and resource_isolation_cfg.get("teacher_resident_on_gpu", True)
+    )
 
     if context_distillation_enabled:
         assert context_distillation_cfg is not None
@@ -665,450 +804,482 @@ def distillation_train(
         context_metrics_cfg = context_distillation_cfg.get("metrics", {})
         context_metrics_enabled = context_metrics_cfg.get("enabled", True)
 
-    # Run validation at the start if configured
-    if val_at_start and total_steps == 0:
-        print("\n🔍 Running initial validation...", flush=True)
-        if NEED_REFIT and POLICY_GENERATION_STALE:
-            refit_policy_generation(
-                student_policy, student_generation, colocated_inference
-            )
-            POLICY_GENERATION_STALE = False
-        else:
-            student_generation.prepare_for_generation()
-        val_metrics, validation_timings = validate(
-            student_generation,
-            val_dataloader,
-            tokenizer,
-            val_task_to_env,
-            step=total_steps,
-            master_config=master_config,
+    if teacher_should_stay_resident:
+        print(
+            "▶ Preparing teacher logprob inference once (resident mode)...",
+            flush=True,
         )
-        student_generation.finish_generation()
-        logger.log_metrics(val_metrics, total_steps, prefix="validation")
-        logger.log_metrics(validation_timings, total_steps, prefix="timing/validation")
+        teacher_policy.prepare_for_lp_inference()
 
     # Run distillation training (multi-epoch until reaching max_num_steps or max_num_epochs)
     batch: BatchedDataDict[DatumSpec]
 
-    while total_steps < max_steps and current_epoch < max_epochs:
-        print(
-            f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_epochs} {'=' * 25}",
-            flush=True,
-        )
+    try:
+        # Run validation at the start if configured
+        if val_at_start and total_steps == 0:
+            print("\n🔍 Running initial validation...", flush=True)
+            if NEED_REFIT and POLICY_GENERATION_STALE:
+                refit_policy_generation(
+                    student_policy, student_generation, colocated_inference
+                )
+                POLICY_GENERATION_STALE = False
+            else:
+                student_generation.prepare_for_generation()
+            val_metrics, validation_timings = validate(
+                student_generation,
+                val_dataloader,
+                tokenizer,
+                val_task_to_env,
+                step=total_steps,
+                master_config=master_config,
+            )
+            student_generation.finish_generation()
+            logger.log_metrics(val_metrics, total_steps, prefix="validation")
+            logger.log_metrics(
+                validation_timings, total_steps, prefix="timing/validation"
+            )
 
-        for batch in dataloader:
+        while total_steps < max_steps and current_epoch < max_epochs:
             print(
-                f"\n{'=' * 25} Step {current_step + 1}/{min(len(dataloader), max_steps)} {'=' * 25}",
+                f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_epochs} {'=' * 25}",
                 flush=True,
             )
-            maybe_gpu_profile_step(student_policy, total_steps + 1)
-            if student_policy != student_generation:
-                maybe_gpu_profile_step(student_generation, total_steps + 1)
-            val_metrics, validation_timings = None, None
 
-            with timer.time("total_step_time"):
-                # Prepare batch
-                print("▶ Preparing batch...", flush=True)
-                with timer.time("data_processing"):
-                    # Repeat batch items
-                    repeated_batch: BatchedDataDict[DatumSpec] = (
-                        batch.repeat_interleave(
-                            master_config["distillation"]["num_generations_per_prompt"]
-                        )
-                    )
-
-                # Generate responses - this updates the LLMMessageLogType in repeated_batch
+            for batch in dataloader:
                 print(
-                    f"▶ Generating responses for batch of size {repeated_batch.size}...",
+                    f"\n{'=' * 25} Step {current_step + 1}/{min(len(dataloader), max_steps)} {'=' * 25}",
                     flush=True,
                 )
-                with timer.time("prepare_for_generation"):
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
-                        refit_policy_generation(
-                            student_policy,
-                            student_generation,
-                            colocated_inference,
-                            timer=timer,
-                        )
-                        POLICY_GENERATION_STALE = False
-                    else:
-                        student_generation.prepare_for_generation()
+                maybe_gpu_profile_step(student_policy, total_steps + 1)
+                if student_policy != student_generation:
+                    maybe_gpu_profile_step(student_generation, total_steps + 1)
+                val_metrics, validation_timings = None, None
 
-                with timer.time("generation"):
-                    # Use async rollouts if vLLM async engine is enabled
-                    if _should_use_async_rollouts(master_config):
-                        (
-                            repeated_batch,
-                            rollout_metrics,
-                        ) = run_async_multi_turn_rollout(
-                            policy_generation=student_generation,
-                            input_batch=repeated_batch,
-                            tokenizer=tokenizer,
-                            task_to_env=task_to_env,
-                            max_seq_len=master_config["policy"][
-                                "max_total_sequence_length"
-                            ],
-                            max_rollout_turns=master_config["distillation"][
-                                "max_rollout_turns"
-                            ],
-                            greedy=False,
-                        )
-                    else:
-                        repeated_batch, rollout_metrics = run_multi_turn_rollout(
-                            policy_generation=student_generation,
-                            input_batch=repeated_batch,
-                            tokenizer=tokenizer,
-                            task_to_env=task_to_env,
-                            max_seq_len=master_config["policy"][
-                                "max_total_sequence_length"
-                            ],
-                            max_rollout_turns=master_config["distillation"][
-                                "max_rollout_turns"
-                            ],
-                            greedy=False,
-                        )
-                    student_generation.finish_generation()
-
-                with timer.time("data_processing"):
-                    # Add loss mask and advantages to each message in LLMMessageLogType
-                    for message_log in repeated_batch["message_log"]:
-                        for message in message_log:
-                            if message["role"] == "assistant":
-                                message["token_loss_mask"] = torch.ones_like(
-                                    message["token_ids"]
-                                )
-                            else:
-                                message["token_loss_mask"] = torch.zeros_like(
-                                    message["token_ids"]
-                                )
-
-                    # Convert updated LLMMessageLogType to FlatMessagesType for training
-                    flat_messages, input_lengths = batched_message_log_to_flat_message(
-                        repeated_batch["message_log"],
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                        make_sequence_length_divisible_by=master_config["policy"][
-                            "make_sequence_length_divisible_by"
-                        ],
-                    )
-
-                    # Create training data from flattened messages
-                    train_data = BatchedDataDict[DistillationLossDataDict](
-                        {
-                            "input_ids": flat_messages["token_ids"],
-                            "input_lengths": input_lengths,
-                            "token_mask": flat_messages["token_loss_mask"],
-                            "sample_mask": repeated_batch["loss_multiplier"],
-                        }
-                    )
-                    # this will be mini-batched inside the policy, so maintain the packed multimodal structure
-                    train_data.update(
-                        flat_messages.get_multimodal_dict(as_tensors=False)
-                    )
-                    train_data.to("cpu")
-                    context_step_metrics: dict[str, float] = {}
-
-                print("▶ Preparing for teacher logprob inference...", flush=True)
-                with timer.time("teacher_logprob_inference_prep"):
-                    teacher_policy.prepare_for_lp_inference()
-
-                print("▶ Computing teacher logprobs...", flush=True)
-                with timer.time("teacher_logprob_inference"):
-                    topk_k = master_config["distillation"]["topk_logits_k"]
-                    if context_distillation_enabled:
-                        context_batch = build_context_distillation_teacher_batch(
-                            message_logs=repeated_batch["message_log"],
-                            sample_mask=train_data["sample_mask"],
-                            student_input_lengths=train_data["input_lengths"],
-                            tokenizer=tokenizer,
-                            teacher_prefix_template=context_teacher_prefix_template,
-                            max_teacher_sequence_length=context_teacher_max_seq_len,
-                            pad_token_id=tokenizer.pad_token_id,
-                            problem_source=context_problem_source,
-                            trace_extractor_type=context_trace_type,
-                            trace_extractor_selection=context_trace_selection,
-                            missing_trace_policy=context_missing_trace_policy,
-                            overflow_policy=context_overflow_policy,
-                            metrics_enabled=context_metrics_enabled,
-                        )
-                        train_data["sample_mask"] = context_batch.sample_mask
-                        context_step_metrics = context_batch.metrics
-
-                        batch_size, student_seq_len = train_data["input_ids"].shape[:2]
-                        if context_batch.teacher_data is None:
-                            train_data["teacher_topk_logits"] = torch.zeros(
-                                (batch_size, student_seq_len, topk_k),
-                                dtype=torch.float32,
+                with timer.time("total_step_time"):
+                    # Prepare batch
+                    print("▶ Preparing batch...", flush=True)
+                    with timer.time("data_processing"):
+                        # Repeat batch items
+                        repeated_batch: BatchedDataDict[DatumSpec] = (
+                            batch.repeat_interleave(
+                                master_config["distillation"][
+                                    "num_generations_per_prompt"
+                                ]
                             )
-                            train_data["teacher_topk_indices"] = torch.zeros(
-                                (batch_size, student_seq_len, topk_k),
-                                dtype=torch.long,
+                        )
+                    # Generate responses - this updates the LLMMessageLogType in repeated_batch
+                    print(
+                        f"▶ Generating responses for batch of size {repeated_batch.size}...",
+                        flush=True,
+                    )
+                    with timer.time("prepare_for_generation"):
+                        if NEED_REFIT and POLICY_GENERATION_STALE:
+                            refit_policy_generation(
+                                student_policy,
+                                student_generation,
+                                colocated_inference,
+                                timer=timer,
+                            )
+                            POLICY_GENERATION_STALE = False
+                        else:
+                            student_generation.prepare_for_generation()
+
+                    with timer.time("generation"):
+                        # Use async rollouts if vLLM async engine is enabled
+                        if _should_use_async_rollouts(master_config):
+                            (
+                                repeated_batch,
+                                rollout_metrics,
+                            ) = run_async_multi_turn_rollout(
+                                policy_generation=student_generation,
+                                input_batch=repeated_batch,
+                                tokenizer=tokenizer,
+                                task_to_env=task_to_env,
+                                max_seq_len=master_config["policy"][
+                                    "max_total_sequence_length"
+                                ],
+                                max_rollout_turns=master_config["distillation"][
+                                    "max_rollout_turns"
+                                ],
+                                greedy=False,
                             )
                         else:
+                            repeated_batch, rollout_metrics = run_multi_turn_rollout(
+                                policy_generation=student_generation,
+                                input_batch=repeated_batch,
+                                tokenizer=tokenizer,
+                                task_to_env=task_to_env,
+                                max_seq_len=master_config["policy"][
+                                    "max_total_sequence_length"
+                                ],
+                                max_rollout_turns=master_config["distillation"][
+                                    "max_rollout_turns"
+                                ],
+                                greedy=False,
+                            )
+                        student_generation.finish_generation()
+
+                    with timer.time("data_processing"):
+                        # Add loss mask and advantages to each message in LLMMessageLogType
+                        for message_log in repeated_batch["message_log"]:
+                            for message in message_log:
+                                if message["role"] == "assistant":
+                                    message["token_loss_mask"] = torch.ones_like(
+                                        message["token_ids"]
+                                    )
+                                else:
+                                    message["token_loss_mask"] = torch.zeros_like(
+                                        message["token_ids"]
+                                    )
+
+                        # Convert updated LLMMessageLogType to FlatMessagesType for training
+                        flat_messages, input_lengths = batched_message_log_to_flat_message(
+                            repeated_batch["message_log"],
+                            pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                            make_sequence_length_divisible_by=master_config["policy"][
+                                "make_sequence_length_divisible_by"
+                            ],
+                        )
+
+                        # Create training data from flattened messages
+                        train_data = BatchedDataDict[DistillationLossDataDict](
+                            {
+                                "input_ids": flat_messages["token_ids"],
+                                "input_lengths": input_lengths,
+                                "token_mask": flat_messages["token_loss_mask"],
+                                "sample_mask": repeated_batch["loss_multiplier"],
+                            }
+                        )
+                        # this will be mini-batched inside the policy, so maintain the packed multimodal structure
+                        train_data.update(
+                            flat_messages.get_multimodal_dict(as_tensors=False)
+                        )
+                        train_data.to("cpu")
+                        context_step_metrics: dict[str, float] = {}
+
+                    print("▶ Preparing for teacher logprob inference...", flush=True)
+                    with timer.time("teacher_logprob_inference_prep"):
+                        if not teacher_should_stay_resident:
+                            teacher_policy.prepare_for_lp_inference()
+
+                    print("▶ Computing teacher logprobs...", flush=True)
+                    with timer.time("teacher_logprob_inference"):
+                        topk_k = master_config["distillation"]["topk_logits_k"]
+                        if context_distillation_enabled:
+                            context_batch = build_context_distillation_teacher_batch(
+                                message_logs=repeated_batch["message_log"],
+                                sample_mask=train_data["sample_mask"],
+                                student_input_lengths=train_data["input_lengths"],
+                                tokenizer=tokenizer,
+                                teacher_prefix_template=context_teacher_prefix_template,
+                                max_teacher_sequence_length=context_teacher_max_seq_len,
+                                pad_token_id=tokenizer.pad_token_id,
+                                problem_source=context_problem_source,
+                                trace_extractor_type=context_trace_type,
+                                trace_extractor_selection=context_trace_selection,
+                                missing_trace_policy=context_missing_trace_policy,
+                                overflow_policy=context_overflow_policy,
+                                metrics_enabled=context_metrics_enabled,
+                            )
+                            train_data["sample_mask"] = context_batch.sample_mask
+                            context_step_metrics = context_batch.metrics
+
+                            batch_size, student_seq_len = train_data[
+                                "input_ids"
+                            ].shape[:2]
+                            if context_batch.teacher_data is None:
+                                train_data["teacher_topk_logits"] = torch.zeros(
+                                    (batch_size, student_seq_len, topk_k),
+                                    dtype=torch.float32,
+                                )
+                                train_data["teacher_topk_indices"] = torch.zeros(
+                                    (batch_size, student_seq_len, topk_k),
+                                    dtype=torch.long,
+                                )
+                            else:
+                                teacher_topk = teacher_policy.get_topk_logits(
+                                    context_batch.teacher_data,
+                                    k=topk_k,
+                                    timer=timer,
+                                )
+                                aligned_logits, aligned_indices = (
+                                    align_teacher_topk_to_student_positions(
+                                        teacher_topk_logits=teacher_topk["topk_logits"],
+                                        teacher_topk_indices=teacher_topk["topk_indices"],
+                                        alignments=context_batch.alignments,
+                                        valid_sample_indices=context_batch.valid_sample_indices,
+                                        student_batch_size=batch_size,
+                                        student_sequence_length=student_seq_len,
+                                        topk=topk_k,
+                                    )
+                                )
+                                train_data["teacher_topk_logits"] = aligned_logits
+                                train_data["teacher_topk_indices"] = aligned_indices
+                        else:
                             teacher_topk = teacher_policy.get_topk_logits(
-                                context_batch.teacher_data,
+                                train_data,
                                 k=topk_k,
                                 timer=timer,
                             )
-                            aligned_logits, aligned_indices = (
-                                align_teacher_topk_to_student_positions(
-                                    teacher_topk_logits=teacher_topk["topk_logits"],
-                                    teacher_topk_indices=teacher_topk["topk_indices"],
-                                    alignments=context_batch.alignments,
-                                    valid_sample_indices=context_batch.valid_sample_indices,
-                                    student_batch_size=batch_size,
-                                    student_sequence_length=student_seq_len,
-                                    topk=topk_k,
-                                )
-                            )
-                            train_data["teacher_topk_logits"] = aligned_logits
-                            train_data["teacher_topk_indices"] = aligned_indices
-                    else:
-                        teacher_topk = teacher_policy.get_topk_logits(
-                            train_data,
-                            k=topk_k,
-                            timer=timer,
-                        )
-                        train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
-                        train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
-
-                print("▶ Preparing for training...", flush=True)
-                with timer.time("training_prep"):
-                    teacher_policy.offload_after_refit()
-                    student_policy.prepare_for_training()  # set model train and reload optim to GPU
-                    POLICY_GENERATION_STALE = True
-
-                print("▶ Training policy...", flush=True)
-                with timer.time("policy_training"):
-                    train_results = student_policy.train(
-                        train_data,
-                        loss_fn,
-                        timer=timer,
-                    )
-
-                is_last_step = (total_steps + 1 >= max_steps) or (
-                    (current_epoch + 1 == max_epochs)
-                    and (current_step + 1 == len(dataloader))
-                )
-
-                # Run validation if it's a validation step or last step with val_at_end
-                if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
-                    val_at_end and is_last_step
-                ):
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
-                        refit_policy_generation(
-                            student_policy, student_generation, colocated_inference
-                        )
-                        POLICY_GENERATION_STALE = False
-                    else:
-                        student_generation.prepare_for_generation()
-                    val_metrics, validation_timings = validate(
-                        student_generation,
-                        val_dataloader,
-                        tokenizer,
-                        val_task_to_env,
-                        step=total_steps + 1,
-                        master_config=master_config,
-                    )
-                    student_generation.finish_generation()
-                    logger.log_metrics(
-                        validation_timings, total_steps + 1, prefix="timing/validation"
-                    )
-                    logger.log_metrics(
-                        val_metrics, total_steps + 1, prefix="validation"
-                    )
-
-                metrics = {
-                    "loss": train_results["loss"].numpy(),
-                    "grad_norm": train_results["grad_norm"].numpy(),
-                    "mean_prompt_length": repeated_batch["length"].numpy(),
-                    "total_num_tokens": input_lengths.numpy(),
-                }
-                metrics.update(train_results["all_mb_metrics"])
-                for k, v in metrics.items():
-                    if k in {
-                        "lr",
-                        "wd",
-                        "global_valid_seqs",
-                        "global_valid_toks",
-                        "mean_prompt_length",
-                    }:
-                        metrics[k] = np.mean(v).item()
-                    else:
-                        metrics[k] = np.sum(v).item()
-                metrics.update(rollout_metrics)
-                metrics.update(context_step_metrics)
-                total_valid_tokens += metrics["global_valid_toks"]
-
-                ## Checkpointing
-                consumed_samples += master_config["distillation"][
-                    "num_prompts_per_step"
-                ]
-                timeout.mark_iteration()
-
-                should_save_by_step = (
-                    is_last_step
-                    or (total_steps + 1) % master_config["checkpointing"]["save_period"]
-                    == 0
-                )
-                # +1 because total_steps is 0-indexed
-                # Check if timeout-based checkpointing is enabled in config.
-                should_save_by_timeout = timeout.check_save()
-
-                if master_config["checkpointing"]["enabled"] and (
-                    should_save_by_step or should_save_by_timeout
-                ):
-                    student_policy.prepare_for_training()
-
-                    distillation_save_state["current_epoch"] = current_epoch
-                    distillation_save_state["current_step"] = current_step + 1
-                    distillation_save_state["total_steps"] = total_steps + 1
-                    distillation_save_state["total_valid_tokens"] = total_valid_tokens
-                    if val_metrics is not None:
-                        distillation_save_state["val_reward"] = val_metrics["accuracy"]
-                    elif "val_reward" in distillation_save_state:
-                        del distillation_save_state["val_reward"]
-                    distillation_save_state["consumed_samples"] = consumed_samples
-
-                    full_metric_name = master_config["checkpointing"]["metric_name"]
-                    if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
-                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
-                            f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
-                            f" e.g. 'val_reward --> 'val:accuracy'"
-                        )
-                        prefix, metric_name = full_metric_name.split(":", 1)
-                        metrics_source = metrics if prefix == "train" else val_metrics
-                        if not metrics_source:
-                            warnings.warn(
-                                f"You asked to save checkpoints based on {metric_name} but no {prefix} metrics were collected. "
-                                "This checkpoint will not be saved as top-k.",
-                                stacklevel=2,
-                            )
-                            if full_metric_name in distillation_save_state:
-                                del distillation_save_state[full_metric_name]
-                        elif metric_name not in metrics_source:
-                            raise ValueError(
-                                f"Metric {metric_name} not found in {prefix} metrics"
-                            )
-                        else:
-                            distillation_save_state[full_metric_name] = metrics_source[
-                                metric_name
+                            train_data["teacher_topk_logits"] = teacher_topk[
+                                "topk_logits"
+                            ]
+                            train_data["teacher_topk_indices"] = teacher_topk[
+                                "topk_indices"
                             ]
 
-                    with timer.time("checkpointing"):
-                        print(
-                            f"Saving checkpoint for step {total_steps + 1}...",
-                            flush=True,
-                        )
-                        checkpoint_path = checkpointer.init_tmp_checkpoint(
-                            total_steps + 1, distillation_save_state, master_config
-                        )
-                        student_policy.save_checkpoint(
-                            weights_path=os.path.join(
-                                checkpoint_path, "policy", "weights"
-                            ),
-                            optimizer_path=os.path.join(
-                                checkpoint_path, "policy", "optimizer"
-                            ),
-                            tokenizer_path=os.path.join(
-                                checkpoint_path, "policy", "tokenizer"
-                            ),
-                            checkpointing_cfg=master_config["checkpointing"],
-                        )
-                        torch.save(
-                            dataloader.state_dict(),
-                            os.path.join(checkpoint_path, "train_dataloader.pt"),
-                        )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
+                    print("▶ Preparing for training...", flush=True)
+                    with timer.time("training_prep"):
+                        if not teacher_should_stay_resident:
+                            teacher_policy.offload_after_refit()
+                        # set model train and reload optim to GPU
+                        student_policy.prepare_for_training()
+                        POLICY_GENERATION_STALE = True
 
-            # Logging
-            # Log training data
-            log_data = {"content": flat_messages["content"]}
-            log_data["input_lengths"] = input_lengths.tolist()
-            logger.log_batched_dict_as_jsonl(
-                log_data, f"train_data_step{total_steps + 1}.jsonl"
-            )
+                    print("▶ Training policy...", flush=True)
+                    with timer.time("policy_training"):
+                        train_results = student_policy.train(
+                            train_data,
+                            loss_fn,
+                            timer=timer,
+                        )
 
-            timing_metrics: dict[str, float] = timer.get_timing_metrics(
-                reduction_op="sum"
-            )  # type: ignore
+                    is_last_step = (total_steps + 1 >= max_steps) or (
+                        (current_epoch + 1 == max_epochs)
+                        and (current_step + 1 == len(dataloader))
+                    )
 
-            print("\n📊 Training Results:")
+                    # Run validation if it's a validation step or last step with val_at_end
+                    if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
+                        val_at_end and is_last_step
+                    ):
+                        if NEED_REFIT and POLICY_GENERATION_STALE:
+                            refit_policy_generation(
+                                student_policy, student_generation, colocated_inference
+                            )
+                            POLICY_GENERATION_STALE = False
+                        else:
+                            student_generation.prepare_for_generation()
+                        val_metrics, validation_timings = validate(
+                            student_generation,
+                            val_dataloader,
+                            tokenizer,
+                            val_task_to_env,
+                            step=total_steps + 1,
+                            master_config=master_config,
+                        )
+                        student_generation.finish_generation()
+                        logger.log_metrics(
+                            validation_timings, total_steps + 1, prefix="timing/validation"
+                        )
+                        logger.log_metrics(
+                            val_metrics, total_steps + 1, prefix="validation"
+                        )
 
-            print(f"  • Loss: {metrics['loss']:.4f}")
-            print(
-                f"  • Mean Generation Length: {rollout_metrics['mean_gen_tokens_per_sample']:.4f}"
-            )
-            if "total_flops" in train_results:
-                total_tflops = (
-                    train_results["total_flops"]
-                    / timing_metrics["policy_training"]
-                    / 1e12
+                    metrics = {
+                        "loss": train_results["loss"].numpy(),
+                        "grad_norm": train_results["grad_norm"].numpy(),
+                        "mean_prompt_length": repeated_batch["length"].numpy(),
+                        "total_num_tokens": input_lengths.numpy(),
+                    }
+                    metrics.update(train_results["all_mb_metrics"])
+                    for k, v in metrics.items():
+                        if k in {
+                            "lr",
+                            "wd",
+                            "global_valid_seqs",
+                            "global_valid_toks",
+                            "mean_prompt_length",
+                        }:
+                            metrics[k] = np.mean(v).item()
+                        else:
+                            metrics[k] = np.sum(v).item()
+                    metrics.update(rollout_metrics)
+                    metrics.update(context_step_metrics)
+                    total_valid_tokens += metrics["global_valid_toks"]
+
+                    ## Checkpointing
+                    consumed_samples += master_config["distillation"][
+                        "num_prompts_per_step"
+                    ]
+                    timeout.mark_iteration()
+
+                    should_save_by_step = (
+                        is_last_step
+                        or (total_steps + 1)
+                        % master_config["checkpointing"]["save_period"]
+                        == 0
+                    )
+                    # +1 because total_steps is 0-indexed
+                    # Check if timeout-based checkpointing is enabled in config.
+                    should_save_by_timeout = timeout.check_save()
+
+                    if master_config["checkpointing"]["enabled"] and (
+                        should_save_by_step or should_save_by_timeout
+                    ):
+                        student_policy.prepare_for_training()
+
+                        distillation_save_state["current_epoch"] = current_epoch
+                        distillation_save_state["current_step"] = current_step + 1
+                        distillation_save_state["total_steps"] = total_steps + 1
+                        distillation_save_state["total_valid_tokens"] = total_valid_tokens
+                        if val_metrics is not None:
+                            distillation_save_state["val_reward"] = val_metrics[
+                                "accuracy"
+                            ]
+                        elif "val_reward" in distillation_save_state:
+                            del distillation_save_state["val_reward"]
+                        distillation_save_state["consumed_samples"] = consumed_samples
+
+                        full_metric_name = master_config["checkpointing"]["metric_name"]
+                        if full_metric_name is not None:
+                            assert full_metric_name.startswith(
+                                "train:"
+                            ) or full_metric_name.startswith("val:"), (
+                                f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
+                                f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
+                                f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
+                                f" e.g. 'val_reward --> 'val:accuracy'"
+                            )
+                            prefix, metric_name = full_metric_name.split(":", 1)
+                            metrics_source = metrics if prefix == "train" else val_metrics
+                            if not metrics_source:
+                                warnings.warn(
+                                    f"You asked to save checkpoints based on {metric_name} but no {prefix} metrics were collected. "
+                                    "This checkpoint will not be saved as top-k.",
+                                    stacklevel=2,
+                                )
+                                if full_metric_name in distillation_save_state:
+                                    del distillation_save_state[full_metric_name]
+                            elif metric_name not in metrics_source:
+                                raise ValueError(
+                                    f"Metric {metric_name} not found in {prefix} metrics"
+                                )
+                            else:
+                                distillation_save_state[full_metric_name] = (
+                                    metrics_source[metric_name]
+                                )
+
+                        with timer.time("checkpointing"):
+                            print(
+                                f"Saving checkpoint for step {total_steps + 1}...",
+                                flush=True,
+                            )
+                            checkpoint_path = checkpointer.init_tmp_checkpoint(
+                                total_steps + 1, distillation_save_state, master_config
+                            )
+                            student_policy.save_checkpoint(
+                                weights_path=os.path.join(
+                                    checkpoint_path, "policy", "weights"
+                                ),
+                                optimizer_path=os.path.join(
+                                    checkpoint_path, "policy", "optimizer"
+                                ),
+                                tokenizer_path=os.path.join(
+                                    checkpoint_path, "policy", "tokenizer"
+                                ),
+                                checkpointing_cfg=master_config["checkpointing"],
+                            )
+                            torch.save(
+                                dataloader.state_dict(),
+                                os.path.join(checkpoint_path, "train_dataloader.pt"),
+                            )
+                            checkpointer.finalize_checkpoint(checkpoint_path)
+
+                # Logging
+                # Log training data
+                log_data = {"content": flat_messages["content"]}
+                log_data["input_lengths"] = input_lengths.tolist()
+                logger.log_batched_dict_as_jsonl(
+                    log_data, f"train_data_step{total_steps + 1}.jsonl"
                 )
-                num_ranks = train_results["num_ranks"]
+
+                timing_metrics: dict[str, float] = timer.get_timing_metrics(
+                    reduction_op="sum"
+                )  # type: ignore
+
+                print("\n📊 Training Results:")
+
+                print(f"  • Loss: {metrics['loss']:.4f}")
                 print(
-                    f"  • Training FLOPS: {total_tflops:.2f} TFLOPS ({total_tflops / num_ranks:.2f} TFLOPS per rank)",
-                    flush=True,
+                    f"  • Mean Generation Length: {rollout_metrics['mean_gen_tokens_per_sample']:.4f}"
                 )
-                if "theoretical_tflops" in train_results:
-                    theoretical_tflops = train_results["theoretical_tflops"]
+                if "total_flops" in train_results:
+                    total_tflops = (
+                        train_results["total_flops"]
+                        / timing_metrics["policy_training"]
+                        / 1e12
+                    )
+                    num_ranks = train_results["num_ranks"]
                     print(
-                        f"  • Training Model Floating Point Utilization: {100 * total_tflops / theoretical_tflops:.2f}%",
+                        f"  • Training FLOPS: {total_tflops:.2f} TFLOPS ({total_tflops / num_ranks:.2f} TFLOPS per rank)",
                         flush=True,
                     )
-                    metrics["train_fp_utilization"] = total_tflops / theoretical_tflops
+                    if "theoretical_tflops" in train_results:
+                        theoretical_tflops = train_results["theoretical_tflops"]
+                        print(
+                            f"  • Training Model Floating Point Utilization: {100 * total_tflops / theoretical_tflops:.2f}%",
+                            flush=True,
+                        )
+                        metrics["train_fp_utilization"] = (
+                            total_tflops / theoretical_tflops
+                        )
 
-            print("\n⏱️  Timing:", flush=True)
-            # Display total time first, separately
-            total_time = timing_metrics.get("total_step_time", 0)
+                print("\n⏱️  Timing:", flush=True)
+                # Display total time first, separately
+                total_time = timing_metrics.get("total_step_time", 0)
 
-            total_num_gpus = (
-                master_config["cluster"]["num_nodes"]
-                * master_config["cluster"]["gpus_per_node"]
-            )
-            metrics.update(
-                {
-                    "tokens_per_sec_per_gpu": metrics["total_num_tokens"]
-                    / total_time
-                    / total_num_gpus
-                }
-            )
-
-            print(f"  • Total step time: {total_time:.2f}s", flush=True)
-
-            # Display all other timing metrics
-            for k, v in sorted(
-                timing_metrics.items(), key=lambda item: item[1], reverse=True
-            ):
-                if k != "total_step_time":
-                    percent = (v / total_time * 100) if total_time > 0 else 0
-                    print(f"  • {k}: {v:.2f}s ({percent:.1f}%)", flush=True)
-
-            timing_metrics["valid_tokens_per_sec_per_gpu"] = (
-                metrics["global_valid_toks"] / total_time / total_num_gpus
-            )
-            logger.log_metrics(metrics, total_steps + 1, prefix="train")
-            logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
-
-            timer.reset()
-            current_step += 1
-            total_steps += 1
-            if should_save_by_timeout:
-                print("Timeout has been reached, stopping training early", flush=True)
-                return
-            if total_steps >= max_steps:
-                print(
-                    "Max number of steps has been reached, stopping training early",
-                    flush=True,
+                total_num_gpus = (
+                    master_config["cluster"]["num_nodes"]
+                    * master_config["cluster"]["gpus_per_node"]
                 )
-                return
+                metrics.update(
+                    {
+                        "tokens_per_sec_per_gpu": metrics["total_num_tokens"]
+                        / total_time
+                        / total_num_gpus
+                    }
+                )
+
+                print(f"  • Total step time: {total_time:.2f}s", flush=True)
+
+                # Display all other timing metrics
+                for k, v in sorted(
+                    timing_metrics.items(), key=lambda item: item[1], reverse=True
+                ):
+                    if k != "total_step_time":
+                        percent = (v / total_time * 100) if total_time > 0 else 0
+                        print(f"  • {k}: {v:.2f}s ({percent:.1f}%)", flush=True)
+
+                timing_metrics["valid_tokens_per_sec_per_gpu"] = (
+                    metrics["global_valid_toks"] / total_time / total_num_gpus
+                )
+                logger.log_metrics(metrics, total_steps + 1, prefix="train")
+                logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
+
+                timer.reset()
+                current_step += 1
+                total_steps += 1
+                if should_save_by_timeout:
+                    print("Timeout has been reached, stopping training early", flush=True)
+                    return
+                if total_steps >= max_steps:
+                    print(
+                        "Max number of steps has been reached, stopping training early",
+                        flush=True,
+                    )
+                    return
 
         # End of epoch
         current_epoch += 1
         current_step = 0  # Reset step counter for new epoch
+    finally:
+        if teacher_should_stay_resident:
+            print(
+                "▶ Offloading teacher policy after training loop teardown...",
+                flush=True,
+            )
+            teacher_policy.offload_after_refit()
 
 
 def validate(

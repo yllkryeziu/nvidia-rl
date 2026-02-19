@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --time=01:00:00
 #SBATCH --output=%x-%j.out
-#SBATCH --partition=booster
+#SBATCH --partition=develbooster
 #SBATCH --account=envcomp
 
 set -euo pipefail
