@@ -10,7 +10,7 @@ loss_fn:
 checkpointing:
   checkpoint_dir: checkpoints/distillation-qwen3-32b-to-4b-base-seqpack
 policy:
-  model_name: Qwen/Qwen3-4B-Base
+  model_name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c
   dtensor_cfg:
     context_parallel_size: 1
   dynamic_batching:
@@ -19,7 +19,7 @@ policy:
     enabled: true
   make_sequence_length_divisible_by: 2
 teacher:
-  model_name: Qwen/Qwen3-32B
+  model_name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-32B/snapshots/9216db5781bf21249d130ec9da846c4624c16137
   dtensor_cfg:
     tensor_parallel_size: 8
     context_parallel_size: 1

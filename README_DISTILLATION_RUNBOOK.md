@@ -24,6 +24,11 @@ Main logs after submission:
 - `<jobid>-logs/ray-head.log`
 - `<jobid>-logs/ray-status.log`
 
+Model path note:
+- The recipe configs referenced in this runbook are pinned to local Hugging Face snapshot paths
+  under `/p/project1/envcomp/yll/.cache/huggingface/hub/...` to work with offline defaults in
+  `ray_bare.sub`.
+
 ## 2) Smoke Tests
 
 ### 2.1 Unit smoke (context-distillation feature tests)

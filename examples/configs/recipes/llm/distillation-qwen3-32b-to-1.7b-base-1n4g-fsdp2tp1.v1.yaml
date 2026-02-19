@@ -1,4 +1,8 @@
 defaults: ./distillation-qwen3-32b-to-1.7b-base-1n8g-fsdp2tp1.v1.yaml
+policy:
+  model_name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B-Base/snapshots/ea980cb0a6c2ae4b936e82123acc929f1cec04c1
+teacher:
+  model_name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-32B/snapshots/9216db5781bf21249d130ec9da846c4624c16137
 checkpointing:
   checkpoint_dir: checkpoints/distillation-qwen3-32b-to-1.7b-base-1n4g-fsdp2tp1
 logger:
