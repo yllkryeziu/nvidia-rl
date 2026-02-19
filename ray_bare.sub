@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=nemo-rl-bare
-#SBATCH --nodes=2
+#SBATCH --nodes=3
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
 #SBATCH --time=01:00:00

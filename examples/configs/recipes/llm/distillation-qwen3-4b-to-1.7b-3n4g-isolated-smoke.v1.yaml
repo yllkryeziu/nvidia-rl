@@ -1,0 +1,18 @@
+defaults: ./distillation-qwen3-32b-to-4b-3n4g-isolated.v1.yaml
+distillation:
+  num_prompts_per_step: 16
+  max_num_steps: 20
+  val_batch_size: 16
+  val_period: 0
+policy:
+  model_name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
+  train_global_batch_size: 16
+  generation_batch_size: 16
+teacher:
+  model_name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c
+checkpointing:
+  checkpoint_dir: checkpoints/distillation-qwen3-4b-to-1.7b-3n4g-isolated-smoke
+logger:
+  log_dir: logs/distillation-qwen3-4b-to-1.7b-3n4g-isolated-smoke
+  wandb:
+    name: distillation-qwen3-4b-to-1.7b-3n4g-isolated-smoke

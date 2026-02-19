@@ -98,15 +98,84 @@ sbatch -N1 --export=ALL,COMMAND="$COMMAND" ray_bare.sub
 ### 3.3 Multi-node, larger recipe
 
 Config examples:
-- `examples/configs/recipes/llm/distillation-qwen3-32b-to-4b-base-2n4g-fsdp2tp1-long.v1.yaml`
+- `examples/configs/recipes/llm/distillation-qwen3-14b-to-4b-2n4g-fsdp2tp1-long.v1.yaml` (recommended first on 2x4 GPUs)
+- `examples/configs/recipes/llm/distillation-qwen3-32b-to-4b-2n4g-fsdp2tp1-long.v1.yaml`
 - `examples/configs/recipes/llm/distillation-qwen3-32b-to-4b-base-2n8g-fsdp2tp2-long.v1.yaml`
 - `examples/configs/recipes/llm/distillation-qwen3-32b-to-4b-base-2n8g-fsdp2tp2-seqpack.v1.yaml`
 
 Run (2 nodes):
 
 ```bash
-COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/distillation-qwen3-32b-to-4b-base-2n4g-fsdp2tp1-long.v1.yaml logger.wandb_enabled=False'
+COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/distillation-qwen3-32b-to-4b-2n4g-fsdp2tp1-long.v1.yaml logger.wandb_enabled=False'
 sbatch -N2 --export=ALL,COMMAND="$COMMAND" ray_bare.sub
+```
+
+### 3.4 Multi-node OOM fallback: smaller teacher first
+
+If `32B -> 4B` fails at teacher logprob prep with CUDA OOM, run `14B -> 4B` first:
+
+```bash
+COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/distillation-qwen3-14b-to-4b-2n4g-fsdp2tp1-long.v1.yaml logger.wandb_enabled=False'
+sbatch -N2 --export=ALL,COMMAND="$COMMAND" ray_bare.sub
+```
+
+If this still OOMs, override teacher to 8B without creating another config:
+
+```bash
+COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/distillation-qwen3-14b-to-4b-2n4g-fsdp2tp1-long.v1.yaml teacher.model_name=/p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218 logger.wandb_enabled=False'
+sbatch -N2 --export=ALL,COMMAND="$COMMAND" ray_bare.sub
+```
+
+### 3.5 Three-pool isolation (train + generation + teacher on separate nodes)
+
+Use this when you want strict role isolation (recommended for larger teachers).
+
+Config:
+- `examples/configs/recipes/llm/distillation-qwen3-32b-to-4b-3n4g-isolated.v1.yaml`
+
+Run (3 nodes, one node per role):
+
+```bash
+COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/distillation-qwen3-32b-to-4b-3n4g-isolated.v1.yaml logger.wandb_enabled=False'
+sbatch -N3 --export=ALL,COMMAND="$COMMAND" ray_bare.sub
+```
+
+Expected setup log marker in `ray-driver.log`:
+- `Isolated clusters created: train=1x4GPUs, inference=1x4GPUs, teacher=1x4GPUs`
+
+Fail-fast validation errors (and what they mean):
+- `requires policy.generation.colocated.enabled=false`: disable colocated generation.
+- `must exactly partition cluster nodes`: `training.num_nodes + generation.num_nodes + teacher.num_nodes` must equal `cluster.num_nodes`.
+- `enforces node-level role isolation`: each role `gpus_per_node` must match `cluster.gpus_per_node`.
+
+### 3.6 Three-pool isolation: smaller-model smoke recipes
+
+These are short smoke runs with smaller teachers/models, still using strict 3-way isolation on `3x4 GPUs`.
+
+Config examples:
+- `examples/configs/recipes/llm/distillation-qwen3-14b-to-4b-3n4g-isolated-smoke.v1.yaml`
+- `examples/configs/recipes/llm/distillation-qwen3-8b-to-4b-3n4g-isolated-smoke.v1.yaml`
+- `examples/configs/recipes/llm/distillation-qwen3-4b-to-1.7b-3n4g-isolated-smoke.v1.yaml`
+
+Run (`14B -> 4B`, smoke):
+
+```bash
+COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/distillation-qwen3-14b-to-4b-3n4g-isolated-smoke.v1.yaml logger.wandb_enabled=False'
+sbatch -N3 --export=ALL,COMMAND="$COMMAND" ray_bare.sub
+```
+
+Run (`8B -> 4B`, smoke):
+
+```bash
+COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/distillation-qwen3-8b-to-4b-3n4g-isolated-smoke.v1.yaml logger.wandb_enabled=False'
+sbatch -N3 --export=ALL,COMMAND="$COMMAND" ray_bare.sub
+```
+
+Run (`4B -> 1.7B`, smoke):
+
+```bash
+COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/distillation-qwen3-4b-to-1.7b-3n4g-isolated-smoke.v1.yaml logger.wandb_enabled=False'
+sbatch -N3 --export=ALL,COMMAND="$COMMAND" ray_bare.sub
 ```
 
 ## 4) Context/Self-Distillation Runs
