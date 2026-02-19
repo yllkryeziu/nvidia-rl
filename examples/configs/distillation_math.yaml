@@ -12,6 +12,20 @@ distillation:
     max_val_samples: 512
     topk_logits_k: 64
     seed: 42
+    context_distillation:
+        enabled: false
+        mode: "self_frozen"
+        problem_source: "original_user_problem"
+        teacher_prefix_template: "You are given a problem and a trace: {problem} + {trace}. Solve it on your own."
+        alignment: "response_token_index"
+        overflow_policy: "truncate_prefix_only"
+        frozen_teacher_source: "base_model"
+        trace_extractor:
+            type: "think_tag"
+            selection: "first"
+            missing_trace_policy: "empty"
+        metrics:
+            enabled: true
 
 loss_fn:
     kl_type: "mixed" # forward, reverse, mixed

@@ -655,3 +655,87 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
         # Configure mocks to skip checkpoint loading
         mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
         setup(master_config, tokenizer, dataset, None)
+
+
+def test_context_distillation_requires_same_teacher_model():
+    from nemo_rl.algorithms.distillation import setup
+
+    master_config = {
+        "policy": {
+            "model_name": "student-model",
+            "generation": {"backend": "vllm", "colocated": {"enabled": True}},
+            "dtensor_cfg": {"enabled": False},
+        },
+        "teacher": {
+            "model_name": "teacher-model",
+            "dtensor_cfg": {"enabled": False},
+        },
+        "loss_fn": {},
+        "distillation": {
+            "seed": 42,
+            "max_rollout_turns": 1,
+            "context_distillation": {
+                "enabled": True,
+                "mode": "self_frozen",
+                "problem_source": "original_user_problem",
+                "alignment": "response_token_index",
+                "frozen_teacher_source": "base_model",
+            },
+        },
+        "data": {"shuffle": False},
+        "logger": {},
+        "checkpointing": {},
+        "cluster": {"num_nodes": 1, "gpus_per_node": 1},
+    }
+
+    tokenizer = MagicMock()
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=10)
+
+    with pytest.raises(
+        AssertionError,
+        match="policy.model_name and teacher.model_name must be identical",
+    ):
+        setup(master_config, tokenizer, dataset, None)
+
+
+def test_context_distillation_requires_single_turn_rollouts():
+    from nemo_rl.algorithms.distillation import setup
+
+    master_config = {
+        "policy": {
+            "model_name": "same-model",
+            "generation": {"backend": "vllm", "colocated": {"enabled": True}},
+            "dtensor_cfg": {"enabled": False},
+        },
+        "teacher": {
+            "model_name": "same-model",
+            "dtensor_cfg": {"enabled": False},
+        },
+        "loss_fn": {},
+        "distillation": {
+            "seed": 42,
+            "max_rollout_turns": 2,
+            "context_distillation": {
+                "enabled": True,
+                "mode": "self_frozen",
+                "problem_source": "original_user_problem",
+                "alignment": "response_token_index",
+                "frozen_teacher_source": "base_model",
+            },
+        },
+        "data": {"shuffle": False},
+        "logger": {},
+        "checkpointing": {},
+        "cluster": {"num_nodes": 1, "gpus_per_node": 1},
+    }
+
+    tokenizer = MagicMock()
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=10)
+
+    with pytest.raises(
+        AssertionError,
+        match="supports single-turn rollouts only",
+    ):
+        setup(master_config, tokenizer, dataset, None)

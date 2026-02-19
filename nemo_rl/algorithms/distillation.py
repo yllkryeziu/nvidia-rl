@@ -29,6 +29,10 @@ from nemo_rl.algorithms.loss_functions import (
     DistillationLossDataDict,
     DistillationLossFn,
 )
+from nemo_rl.algorithms.context_distillation_utils import (
+    align_teacher_topk_to_student_positions,
+    build_context_distillation_teacher_batch,
+)
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
@@ -70,6 +74,28 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
+class ContextDistillationTraceExtractorConfig(TypedDict):
+    type: str
+    selection: str
+    missing_trace_policy: str
+
+
+class ContextDistillationMetricsConfig(TypedDict):
+    enabled: bool
+
+
+class ContextDistillationConfig(TypedDict):
+    enabled: bool
+    mode: str
+    problem_source: str
+    teacher_prefix_template: str
+    trace_extractor: ContextDistillationTraceExtractorConfig
+    alignment: str
+    overflow_policy: str
+    frozen_teacher_source: str
+    metrics: ContextDistillationMetricsConfig
+
+
 class DistillationConfig(TypedDict):
     # Training configuration
     num_prompts_per_step: int
@@ -86,6 +112,7 @@ class DistillationConfig(TypedDict):
     max_val_samples: int
     topk_logits_k: int
     seed: int
+    context_distillation: NotRequired[ContextDistillationConfig]
 
 
 class DistillationSaveState(TypedDict):
@@ -217,6 +244,40 @@ def setup(
 
     # Set random seed
     set_seed(distillation_config["seed"])
+
+    context_distillation_cfg = distillation_config.get("context_distillation")
+    if context_distillation_cfg and context_distillation_cfg.get("enabled", False):
+        if context_distillation_cfg.get("mode", "self_frozen") != "self_frozen":
+            raise AssertionError(
+                "distillation.context_distillation.mode must be 'self_frozen' for V1."
+            )
+        if (
+            context_distillation_cfg.get("frozen_teacher_source", "base_model")
+            != "base_model"
+        ):
+            raise AssertionError(
+                "distillation.context_distillation.frozen_teacher_source must be 'base_model' for V1."
+            )
+        if (
+            context_distillation_cfg.get("alignment", "response_token_index")
+            != "response_token_index"
+        ):
+            raise AssertionError(
+                "distillation.context_distillation.alignment must be 'response_token_index' for V1."
+            )
+        if (
+            context_distillation_cfg.get("problem_source", "original_user_problem")
+            != "original_user_problem"
+        ):
+            raise AssertionError(
+                "distillation.context_distillation.problem_source must be 'original_user_problem' for V1."
+            )
+        assert policy_config["model_name"] == teacher_config["model_name"], (
+            "For self_frozen context distillation V1, policy.model_name and teacher.model_name must be identical."
+        )
+        assert distillation_config["max_rollout_turns"] == 1, (
+            "Context distillation V1 supports single-turn rollouts only. Set distillation.max_rollout_turns=1."
+        )
 
     # ==========================
     #         Logger
@@ -554,6 +615,55 @@ def distillation_train(
     max_steps = master_config["distillation"][
         "max_num_steps"
     ]  # max number of steps to train for
+    context_distillation_cfg = master_config["distillation"].get(
+        "context_distillation"
+    )
+    context_distillation_enabled = bool(
+        context_distillation_cfg and context_distillation_cfg.get("enabled", False)
+    )
+    context_metrics_enabled = True
+    context_teacher_prefix_template = ""
+    context_problem_source = "original_user_problem"
+    context_trace_type = "think_tag"
+    context_trace_selection = "first"
+    context_missing_trace_policy = "empty"
+    context_overflow_policy = "truncate_prefix_only"
+    context_teacher_max_seq_len = master_config["teacher"].get(
+        "max_total_sequence_length",
+        master_config["policy"]["max_total_sequence_length"],
+    )
+
+    if context_distillation_enabled:
+        assert context_distillation_cfg is not None
+        if context_distillation_cfg.get("mode", "self_frozen") != "self_frozen":
+            raise ValueError(
+                "distillation.context_distillation.mode must be 'self_frozen' for V1."
+            )
+        if (
+            context_distillation_cfg.get("alignment", "response_token_index")
+            != "response_token_index"
+        ):
+            raise ValueError(
+                "distillation.context_distillation.alignment must be 'response_token_index' for V1."
+            )
+        context_problem_source = context_distillation_cfg.get(
+            "problem_source", context_problem_source
+        )
+        context_teacher_prefix_template = context_distillation_cfg.get(
+            "teacher_prefix_template",
+            "You are given a problem and a trace: {problem} + {trace}. Solve it on your own.",
+        )
+        trace_cfg = context_distillation_cfg.get("trace_extractor", {})
+        context_trace_type = trace_cfg.get("type", context_trace_type)
+        context_trace_selection = trace_cfg.get("selection", context_trace_selection)
+        context_missing_trace_policy = trace_cfg.get(
+            "missing_trace_policy", context_missing_trace_policy
+        )
+        context_overflow_policy = context_distillation_cfg.get(
+            "overflow_policy", context_overflow_policy
+        )
+        context_metrics_cfg = context_distillation_cfg.get("metrics", {})
+        context_metrics_enabled = context_metrics_cfg.get("enabled", True)
 
     # Run validation at the start if configured
     if val_at_start and total_steps == 0:
@@ -695,6 +805,7 @@ def distillation_train(
                         flat_messages.get_multimodal_dict(as_tensors=False)
                     )
                     train_data.to("cpu")
+                    context_step_metrics: dict[str, float] = {}
 
                 print("▶ Preparing for teacher logprob inference...", flush=True)
                 with timer.time("teacher_logprob_inference_prep"):
@@ -702,13 +813,63 @@ def distillation_train(
 
                 print("▶ Computing teacher logprobs...", flush=True)
                 with timer.time("teacher_logprob_inference"):
-                    teacher_topk = teacher_policy.get_topk_logits(
-                        train_data,
-                        k=master_config["distillation"]["topk_logits_k"],
-                        timer=timer,
-                    )
-                    train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
-                    train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
+                    topk_k = master_config["distillation"]["topk_logits_k"]
+                    if context_distillation_enabled:
+                        context_batch = build_context_distillation_teacher_batch(
+                            message_logs=repeated_batch["message_log"],
+                            sample_mask=train_data["sample_mask"],
+                            student_input_lengths=train_data["input_lengths"],
+                            tokenizer=tokenizer,
+                            teacher_prefix_template=context_teacher_prefix_template,
+                            max_teacher_sequence_length=context_teacher_max_seq_len,
+                            pad_token_id=tokenizer.pad_token_id,
+                            problem_source=context_problem_source,
+                            trace_extractor_type=context_trace_type,
+                            trace_extractor_selection=context_trace_selection,
+                            missing_trace_policy=context_missing_trace_policy,
+                            overflow_policy=context_overflow_policy,
+                            metrics_enabled=context_metrics_enabled,
+                        )
+                        train_data["sample_mask"] = context_batch.sample_mask
+                        context_step_metrics = context_batch.metrics
+
+                        batch_size, student_seq_len = train_data["input_ids"].shape[:2]
+                        if context_batch.teacher_data is None:
+                            train_data["teacher_topk_logits"] = torch.zeros(
+                                (batch_size, student_seq_len, topk_k),
+                                dtype=torch.float32,
+                            )
+                            train_data["teacher_topk_indices"] = torch.zeros(
+                                (batch_size, student_seq_len, topk_k),
+                                dtype=torch.long,
+                            )
+                        else:
+                            teacher_topk = teacher_policy.get_topk_logits(
+                                context_batch.teacher_data,
+                                k=topk_k,
+                                timer=timer,
+                            )
+                            aligned_logits, aligned_indices = (
+                                align_teacher_topk_to_student_positions(
+                                    teacher_topk_logits=teacher_topk["topk_logits"],
+                                    teacher_topk_indices=teacher_topk["topk_indices"],
+                                    alignments=context_batch.alignments,
+                                    valid_sample_indices=context_batch.valid_sample_indices,
+                                    student_batch_size=batch_size,
+                                    student_sequence_length=student_seq_len,
+                                    topk=topk_k,
+                                )
+                            )
+                            train_data["teacher_topk_logits"] = aligned_logits
+                            train_data["teacher_topk_indices"] = aligned_indices
+                    else:
+                        teacher_topk = teacher_policy.get_topk_logits(
+                            train_data,
+                            k=topk_k,
+                            timer=timer,
+                        )
+                        train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
+                        train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
 
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
@@ -775,6 +936,7 @@ def distillation_train(
                     else:
                         metrics[k] = np.sum(v).item()
                 metrics.update(rollout_metrics)
+                metrics.update(context_step_metrics)
                 total_valid_tokens += metrics["global_valid_toks"]
 
                 ## Checkpointing
