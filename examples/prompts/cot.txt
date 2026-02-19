@@ -1,4 +1,1 @@
-Think step-by-step to solve the following problem. Output your answer inside of \\boxed{{}} tags.:
-{}
-
-Let's think step-by-step
+Please solve the following math problem step by step, and put your final answer within \\boxed{}.\n\nProblem: {}
