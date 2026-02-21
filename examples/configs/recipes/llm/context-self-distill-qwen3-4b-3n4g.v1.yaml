@@ -1,0 +1,285 @@
+distillation:
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 1
+  max_rollout_turns: 1
+  max_num_steps: 1000
+  max_num_epochs: 1
+  val_batch_size: 2
+  val_period: 50
+  val_at_start: false
+  val_at_end: true
+  max_val_samples: 128
+  topk_logits_k: 64
+  seed: 42
+  context_distillation:
+    enabled: true
+    mode: self_frozen
+    problem_source: original_user_problem
+    teacher_prefix_template: |
+      ### TASK
+      You will receive an input containing two parts: a **problem statement** and a **reasoning trace** (an authentic, detailed internal monologue of someone working through the problem).
+
+      Ask yourself: was this problem fundamentally easy, moderate, or hard for a careful human thinker? Based on that judgment, decide whether the original reasoning is *underthinking* (too sparse or rushed for a hard problem) or *overthinking* (unnecessarily elaborate for an easy problem).
+
+      Then let that judgment guide your edits:
+      - If the problem is easy and the trace is overthinking, your job is to carefully trim excess without flattening the voice or exploratory feel.
+      - If the problem is hard and the trace is underthinking, your job is to deepen the reasoning, slow it down, and add missing exploration.
+
+      Your job is to improve the reasoning trace WITHOUT destroying its voice. Your resulting reasoning process should explore the problem at a depth appropriate to its true difficulty, through a systematic long thinking process when needed.
+
+      ### THE ORIGINAL STYLE AND TONE MUST SURVIVE
+      This is your primary constraint. The original trace sounds like a person thinking out loud. Your reasoning must also sound like a person thinking out loud, the SAME person. If the original says "Wait, that can't be right..." your version should feel equally spontaneous and human. Never flatten exploratory language into formal explanation. Each step should include detailed considerations such as analyzing questions, brainstorming new ideas, verifying the accuracy of the current steps, refining any errors, and revisiting previous steps.
+
+      ### WHAT YOU MUST TO:
+      - FIX mistakes if you see clear logical errors and wrong assumptions
+      - KEEP productive tangents, self-corrections, and exploratory branches. These are features.
+      - INSERT missing logical steps. When there's a gap, add the missing reasoning AS IF the original thinker said it. Match their cadence and vocabulary.
+      - EXPAND compressed steps of the only reasoning by showing the work (calculations, sub-reasoning) inline, but write it how THEY would write it, not how a textbook would.
+      - DELETE only genuine redundancy that leads to nothing and does not contribute to the solution.
+
+      ### RESTRICTIONS:
+      - DO NOT rewrite sentences that are already clear
+      - DO NOT remove phrases like "hmm," "wait," "actually," "let me think..."
+      - DO NOT add formal transitions ("Furthermore," "In conclusion,")
+      - DO NOT convert the monologue into structured prose
+      - DO NOT summarize or compress unless the problem is clearly overthought for its difficulty
+
+      ### OPERATING PRINCIPLE:
+      Preserve and reuse original reasoning steps wherever possible. When you must add text, imitate the original's style closely. Explore several different paths of reasoning like the original if the problem difficulty demands that.
+
+      ### OUTPUT RULES:
+      - Your output has to have a clear, step-by-step summary that walks through the key steps taken to arrive at the answer. This summary should:
+          - Don't write step-by-step summary anywhere
+          - Present the logical progression in clean, readable steps (not the raw internal monologue)
+          - Conclude with the final answer in the same format as the original (e.g., \boxed{{}})
+      - **CRITICAL:** The final answer section must ALWAYS include a step-by-step summary before the boxed answer. NEVER jump straight from reasoning to just \boxed{{}} with no summary.
+
+      ### THE INPUT FOLLOWS:
+      [Problem]
+      {problem}
+      [Reasoning Trace]
+      {trace}
+
+      Your new solution:
+    alignment: response_token_index
+    overflow_policy: truncate_prefix_only
+    frozen_teacher_source: base_model
+    trace_extractor:
+      type: think_tag
+      selection: first
+      missing_trace_policy: empty
+    metrics:
+      enabled: true
+  resource_isolation:
+    enabled: true
+    teacher_resident_on_gpu: true
+    roles:
+      training:
+        num_nodes: 1
+        gpus_per_node: 4
+      generation:
+        num_nodes: 1
+        gpus_per_node: 4
+      teacher:
+        num_nodes: 1
+        gpus_per_node: 4
+
+loss_fn:
+  kl_type: reverse
+  mixed_kl_weight: 0.5
+  zero_outside_topk: false
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: checkpoints/context-self-distill-qwen3-4b-3n4g
+  metric_name: val:accuracy
+  higher_is_better: true
+  keep_top_k: 3
+  save_period: 100
+  checkpoint_must_save_by: null
+  model_save_format: safetensors
+  save_consolidated: false
+
+policy:
+  model_name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c
+  tokenizer:
+    name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c
+    chat_template_kwargs: null
+  train_global_batch_size: 4
+  train_micro_batch_size: 1
+  generation_batch_size: 2
+  logprob_batch_size: 1
+  max_total_sequence_length: 20480
+  precision: bfloat16
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: false
+  dtensor_cfg:
+    enabled: true
+    _v2: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+  dynamic_batching:
+    enabled: true
+    train_mb_tokens: 20480
+    logprob_mb_tokens: 20480
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: 20480
+    logprob_mb_tokens: 20480
+    algorithm: modified_first_fit_decreasing
+    sequence_length_round: 64
+  max_grad_norm: 1.0
+  make_sequence_length_divisible_by: 2
+  optimizer:
+    name: torch.optim.AdamW
+    kwargs:
+      lr: 1.0e-5
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1.0e-8
+      foreach: false
+      fused: false
+  scheduler:
+    - name: torch.optim.lr_scheduler.LinearLR
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 20
+    - name: torch.optim.lr_scheduler.ConstantLR
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [20]
+  generation:
+    backend: vllm
+    max_new_tokens: 16384
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: false
+      precision: bfloat16
+      kv_cache_dtype: auto
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.55
+      max_model_len: 20480
+      enforce_eager: false
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      distributed_executor_backend: null
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 1
+
+teacher:
+  model_name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c
+  tokenizer:
+    name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c
+    chat_template_kwargs: null
+  train_global_batch_size: 4
+  train_micro_batch_size: 1
+  generation_batch_size: 2
+  logprob_batch_size: 1
+  max_total_sequence_length: 20480
+  precision: bfloat16
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: false
+  dtensor_cfg:
+    enabled: true
+    _v2: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+  dynamic_batching:
+    enabled: true
+    train_mb_tokens: 20480
+    logprob_mb_tokens: 20480
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: 20480
+    logprob_mb_tokens: 20480
+    algorithm: modified_first_fit_decreasing
+    sequence_length_round: 64
+  max_grad_norm: 1.0
+  make_sequence_length_divisible_by: 2
+  optimizer:
+    name: torch.optim.AdamW
+    kwargs:
+      lr: 1.0e-5
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1.0e-8
+      foreach: false
+      fused: false
+  scheduler:
+    - name: torch.optim.lr_scheduler.LinearLR
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 20
+    - name: torch.optim.lr_scheduler.ConstantLR
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [20]
+  generation: null
+
+data:
+  max_input_seq_length: 4096
+  shuffle: true
+  train:
+    dataset_name: ResponseDataset
+    data_path: open-thoughts/OpenThoughts-114k
+    subset: metadata
+    split: train
+    input_key: problem
+    output_key: ground_truth_solution
+    processor: math_hf_data_processor
+  validation:
+    dataset_name: AIME2024
+    repeat: 8
+  default:
+    prompt_file: examples/prompts/cot.txt
+    system_prompt_file: null
+    env_name: math
+
+env:
+  math:
+    num_workers: 8
+
+logger:
+  log_dir: logs/context-self-distill-qwen3-4b-3n4g
+  num_val_samples_to_print: 5
+  wandb_enabled: true
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: nemo-distillation
+    name: context-self-distill-qwen3-4b-3n4g
+  tensorboard:
+    log_dir: tb_logs-context-self-distill-qwen3-4b-3n4g
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 3
