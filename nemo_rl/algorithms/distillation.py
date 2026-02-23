@@ -369,6 +369,93 @@ def _populate_teacher_topk_for_train_data(
             )
             train_data["teacher_topk_logits"] = aligned_logits
             train_data["teacher_topk_indices"] = aligned_indices
+
+            if debug_print_first_sample:
+                # One-time sanity check: does teacher top-k support the student's first response token
+                # (ideally the first token piece of "<think>") at the first scored assistant position?
+                sample0_alignment = None
+                for alignment in context_batch.alignments:
+                    if alignment.sample_idx == 0:
+                        sample0_alignment = alignment
+                        break
+                if sample0_alignment is not None and sample0_alignment.num_response_tokens > 0:
+                    student_pred_row = sample0_alignment.student_pred_start
+                    first_response_col = student_pred_row + 1
+                    if (
+                        0 <= student_pred_row < aligned_indices.shape[1]
+                        and 0 <= first_response_col < train_data["input_ids"].shape[1]
+                    ):
+                        student_first_token_id = int(
+                            train_data["input_ids"][0, first_response_col].item()
+                        )
+                        topk_ids = (
+                            aligned_indices[0, student_pred_row, :]
+                            .detach()
+                            .cpu()
+                            .tolist()
+                        )
+                        topk_logits_vals = (
+                            aligned_logits[0, student_pred_row, :]
+                            .detach()
+                            .cpu()
+                            .tolist()
+                        )
+                        student_rank = next(
+                            (
+                                rank
+                                for rank, tok_id in enumerate(topk_ids)
+                                if int(tok_id) == student_first_token_id
+                            ),
+                            None,
+                        )
+                        think_token_ids = tokenizer(
+                            "<think>",
+                            add_special_tokens=False,
+                            return_tensors="pt",
+                        )["input_ids"][0].tolist()
+                        think_first_token_id = (
+                            int(think_token_ids[0]) if len(think_token_ids) > 0 else None
+                        )
+                        think_first_rank = (
+                            next(
+                                (
+                                    rank
+                                    for rank, tok_id in enumerate(topk_ids)
+                                    if int(tok_id) == think_first_token_id
+                                ),
+                                None,
+                            )
+                            if think_first_token_id is not None
+                            else None
+                        )
+                        preview_n = min(10, len(topk_ids))
+                        topk_preview = [
+                            {
+                                "rank": i + 1,
+                                "id": int(topk_ids[i]),
+                                "tok": _token_debug_str(tokenizer, int(topk_ids[i])),
+                                "logit": float(topk_logits_vals[i]),
+                            }
+                            for i in range(preview_n)
+                        ]
+                        print(
+                            (
+                                "\n===== CONTEXT DISTILLATION TEACHER TOP-K CHECK =====\n"
+                                f"sample_idx: 0\n"
+                                f"student_first_response_token_id: {student_first_token_id}\n"
+                                f"student_first_response_token: {_token_debug_str(tokenizer, student_first_token_id)}\n"
+                                f"student_first_response_token_rank_in_teacher_topk: "
+                                f"{(student_rank + 1) if student_rank is not None else 'not_in_topk'}\n"
+                                f"tokenization('<think>'): {think_token_ids}\n"
+                                f"tokenization('<think>') pieces: "
+                                f"{[_token_debug_str(tokenizer, int(t)) for t in think_token_ids]}\n"
+                                f"first_token_of_<think>_rank_in_teacher_topk: "
+                                f"{(think_first_rank + 1) if think_first_rank is not None else 'not_in_topk'}\n"
+                                f"teacher_topk_preview_first_scored_pos: {topk_preview}\n"
+                                "===== END CONTEXT DISTILLATION TEACHER TOP-K CHECK =====\n"
+                            ),
+                            flush=True,
+                        )
     else:
         teacher_topk = teacher_policy.get_topk_logits(
             train_data,
@@ -426,6 +513,19 @@ def _mean_aggregate_metric_dicts(metric_dicts: list[dict[str, Any]]) -> dict[str
         key: float(np.mean(values)) if len(values) > 0 else 0.0
         for key, values in per_key_values.items()
     }
+
+
+def _token_debug_str(tokenizer, token_id: int) -> str:
+    try:
+        piece = tokenizer.convert_ids_to_tokens([token_id])[0]
+    except Exception:
+        piece = None
+    if piece is None:
+        try:
+            piece = tokenizer.decode([token_id], skip_special_tokens=False)
+        except Exception:
+            piece = "<decode_error>"
+    return str(piece)
 
 
 def _validate_resource_isolation_cfg(

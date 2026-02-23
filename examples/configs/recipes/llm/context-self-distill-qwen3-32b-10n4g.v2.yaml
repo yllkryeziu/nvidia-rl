@@ -105,7 +105,8 @@ policy:
   model_name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-32B/snapshots/9216db5781bf21249d130ec9da846c4624c16137
   tokenizer:
     name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-32B/snapshots/9216db5781bf21249d130ec9da846c4624c16137
-    chat_template_kwargs: null
+    chat_template_kwargs:
+      enable_thinking: true
   train_global_batch_size: 16  # grad_accum = 16 / (1 MBS * 8 DP) = 2 steps
   train_micro_batch_size: 1
   generation_batch_size: 2  # 1 vLLM engine; conservative — 32B KV at 20K seq len is heavy
@@ -188,7 +189,8 @@ teacher:
   model_name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-32B/snapshots/9216db5781bf21249d130ec9da846c4624c16137
   tokenizer:
     name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-32B/snapshots/9216db5781bf21249d130ec9da846c4624c16137
-    chat_template_kwargs: null
+    chat_template_kwargs:
+      enable_thinking: true
   train_global_batch_size: 16
   train_micro_batch_size: 1
   generation_batch_size: 2

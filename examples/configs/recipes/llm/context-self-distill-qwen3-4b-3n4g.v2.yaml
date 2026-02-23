@@ -105,7 +105,8 @@ policy:
   model_name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c
   tokenizer:
     name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c
-    chat_template_kwargs: null
+    chat_template_kwargs:
+      enable_thinking: true
   train_global_batch_size: 16  # grad_accum = 16 / (1 MBS * 2 DP) = 8 steps
   train_micro_batch_size: 1
   generation_batch_size: 16  # split across 4 vLLM engines = 4 prompts/engine
@@ -188,7 +189,8 @@ teacher:
   model_name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c
   tokenizer:
     name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c
-    chat_template_kwargs: null
+    chat_template_kwargs:
+      enable_thinking: true
   train_global_batch_size: 16
   train_micro_batch_size: 1
   generation_batch_size: 16

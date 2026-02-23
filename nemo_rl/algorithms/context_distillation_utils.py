@@ -66,6 +66,47 @@ def _tokenize_text(
     return input_ids.to(dtype=torch.long, device="cpu")
 
 
+def _build_teacher_chat_prefix_text(
+    *, tokenizer: PreTrainedTokenizerBase, teacher_prefix_payload: str
+) -> str:
+    apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
+    if apply_chat_template is None or not callable(apply_chat_template):
+        raise ValueError(
+            "Context distillation requires tokenizer.apply_chat_template to build the "
+            "teacher scoring context."
+        )
+
+    try:
+        formatted = apply_chat_template(
+            [{"role": "user", "content": teacher_prefix_payload}],
+            tokenize=False,
+            add_generation_prompt=True,
+            add_special_tokens=False,
+        )
+    except TypeError as e:
+        raise ValueError(
+            "Context distillation teacher chat prefix creation failed. The tokenizer "
+            "must support apply_chat_template(..., tokenize=False, "
+            "add_generation_prompt=True, add_special_tokens=False)."
+        ) from e
+
+    if isinstance(formatted, list):
+        if len(formatted) != 1 or not isinstance(formatted[0], str):
+            raise ValueError(
+                "Context distillation expected a single chat-formatted prefix string "
+                f"but got list output of length {len(formatted)}."
+            )
+        formatted = formatted[0]
+
+    if not isinstance(formatted, str):
+        raise ValueError(
+            "Context distillation expected tokenizer.apply_chat_template(..., "
+            f"tokenize=False) to return str, got {type(formatted).__name__}."
+        )
+
+    return formatted
+
+
 def _extract_problem_from_extra_env_info(extra_env_info: Any) -> str:
     if not isinstance(extra_env_info, dict):
         raise ValueError(
@@ -172,8 +213,12 @@ def build_context_distillation_teacher_batch(
             sample0_problem = _extract_problem_from_extra_env_info(extra_env_infos[0])
             sample0_response_text, _, _ = _extract_last_assistant_payload(message_logs[0])
             sample0_trace = extract_first_think_span(sample0_response_text)
-            sample0_teacher_context = teacher_prefix_template.format(
+            sample0_teacher_payload = teacher_prefix_template.format(
                 problem=sample0_problem, trace=sample0_trace
+            )
+            sample0_teacher_chat_prefix = _build_teacher_chat_prefix_text(
+                tokenizer=tokenizer,
+                teacher_prefix_payload=sample0_teacher_payload,
             )
             print(
                 (
@@ -184,9 +229,11 @@ def build_context_distillation_teacher_batch(
                     f"{sample0_response_text}\n\n"
                     "2) EXTRACTED TRACE\n"
                     f"{sample0_trace}\n\n"
-                    "3) TEACHER CONTEXT (PROBLEM + EXTRACTED TRACE)\n"
-                    f"{sample0_teacher_context}\n\n"
-                    "4) TEXT THE TEACHER SCORES\n"
+                    "3) RAW TEACHER PROMPT PAYLOAD (PROBLEM + EXTRACTED TRACE)\n"
+                    f"{sample0_teacher_payload}\n\n"
+                    "4) CHAT-FORMATTED TEACHER PREFIX (ACTUAL CONTEXT TOKENIZED)\n"
+                    f"{sample0_teacher_chat_prefix}\n\n"
+                    "5) TEXT THE TEACHER SCORES\n"
                     f"{sample0_response_text}\n"
                     "===== END CONTEXT DISTILLATION FIRST-SAMPLE DUMP =====\n"
                 ),
@@ -227,8 +274,14 @@ def build_context_distillation_teacher_batch(
                 _tokenize_text(trace, tokenizer, add_special_tokens=False).numel()
             )
 
-        prefix_text = teacher_prefix_template.format(problem=problem, trace=trace)
-        prefix_tokens = _tokenize_text(prefix_text, tokenizer, add_special_tokens=False)
+        teacher_prefix_payload = teacher_prefix_template.format(problem=problem, trace=trace)
+        teacher_chat_prefix = _build_teacher_chat_prefix_text(
+            tokenizer=tokenizer,
+            teacher_prefix_payload=teacher_prefix_payload,
+        )
+        prefix_tokens = _tokenize_text(
+            teacher_chat_prefix, tokenizer, add_special_tokens=False
+        )
 
         response_length = int(response_tokens.numel())
         if response_length > max_teacher_sequence_length:

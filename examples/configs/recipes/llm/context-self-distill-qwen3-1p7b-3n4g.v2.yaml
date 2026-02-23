@@ -105,7 +105,8 @@ policy:
   model_name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
   tokenizer:
     name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
-    chat_template_kwargs: null
+    chat_template_kwargs:
+      enable_thinking: true
   train_global_batch_size: 16
   train_micro_batch_size: 1
   generation_batch_size: 16
@@ -188,7 +189,8 @@ teacher:
   model_name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
   tokenizer:
     name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
-    chat_template_kwargs: null
+    chat_template_kwargs:
+      enable_thinking: true
   train_global_batch_size: 16
   train_micro_batch_size: 1
   generation_batch_size: 16
