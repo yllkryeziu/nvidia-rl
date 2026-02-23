@@ -35,6 +35,8 @@ class ResponseDataset(RawDataset):
         output_key: Key for the output text, default is "output"
         subset: Optional subset name for the dataset, used for HuggingFace datasets
         split: Optional split name for the dataset, used for HuggingFace datasets
+        filter_column: Optional column name to filter on
+        filter_value: Optional value used for equality filtering
         split_validation_size: Size of the validation data, default is 0
         seed: Seed for train/validation split when split_validation_size > 0, default is 42
     """
@@ -46,6 +48,8 @@ class ResponseDataset(RawDataset):
         output_key: str = "output",
         subset: Optional[str] = None,
         split: Optional[str] = None,
+        filter_column: Optional[str] = None,
+        filter_value: Optional[Any] = None,
         split_validation_size: float = 0,
         seed: int = 42,
         **kwargs,
@@ -59,6 +63,34 @@ class ResponseDataset(RawDataset):
 
         # load from local or huggingface
         self.dataset = load_dataset_from_path(data_path, subset, split)
+        has_filter_column = filter_column is not None
+        has_filter_value = filter_value is not None
+        if has_filter_column != has_filter_value:
+            raise ValueError(
+                "Both filter_column and filter_value must be provided together."
+            )
+        if has_filter_column:
+            assert filter_column is not None
+            if filter_column not in self.dataset.column_names:
+                raise ValueError(
+                    f"filter_column='{filter_column}' not found in dataset columns: "
+                    f"{self.dataset.column_names}"
+                )
+            before_count = len(self.dataset)
+            self.dataset = self.dataset.filter(
+                lambda row: row[filter_column] == filter_value
+            )
+            after_count = len(self.dataset)
+            print(
+                "  ✓ ResponseDataset filter applied: "
+                f"{filter_column} == {filter_value!r} "
+                f"({before_count} -> {after_count})"
+            )
+            if after_count == 0:
+                raise ValueError(
+                    "Filtering resulted in an empty dataset for "
+                    f"{filter_column} == {filter_value!r}."
+                )
 
         # format the dataset
         if "messages" not in self.dataset.column_names:

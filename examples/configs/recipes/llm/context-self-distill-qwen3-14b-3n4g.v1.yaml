@@ -8,8 +8,9 @@ distillation:
   val_period: 50
   val_at_start: false
   val_at_end: true
-  max_val_samples: 64
-  topk_logits_k: 32
+  max_val_samples: 50
+  val_track_train_metrics: true
+  topk_logits_k: 64
   seed: 42
   context_distillation:
     enabled: true
@@ -248,12 +249,13 @@ data:
     data_path: open-thoughts/OpenThoughts-114k
     subset: metadata
     split: train
+    filter_column: domain
+    filter_value: math
+    split_validation_size: 50
+    seed: 42
     input_key: problem
     output_key: ground_truth_solution
     processor: math_hf_data_processor
-  validation:
-    dataset_name: AIME2024
-    repeat: 8
   default:
     prompt_file: examples/prompts/cot.txt
     system_prompt_file: null

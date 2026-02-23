@@ -1,10 +1,10 @@
 distillation:
-  num_prompts_per_step: 4
+  num_prompts_per_step: 16
   num_generations_per_prompt: 1
   max_rollout_turns: 1
   max_num_steps: 1000
   max_num_epochs: 1
-  val_batch_size: 1
+  val_batch_size: 2
   val_period: 50
   val_at_start: false
   val_at_end: true
@@ -76,13 +76,13 @@ distillation:
     teacher_resident_on_gpu: true
     roles:
       training:
-        num_nodes: 1
+        num_nodes: 8  # TP=4, DP=8. Static: 32B/32*16 = 16 GB/GPU + ~6 GB activations = ~22 GB
         gpus_per_node: 4
       generation:
-        num_nodes: 1
+        num_nodes: 1  # vLLM TP=4: 1 engine; 32B/4 = 16 GB/GPU, ~16 GB KV budget
         gpus_per_node: 4
       teacher:
-        num_nodes: 1
+        num_nodes: 1  # TP=4, DP=1, no optimizer: 32B/4 = 16 GB/GPU + activations = ~22 GB
         gpus_per_node: 4
 
 loss_fn:
@@ -92,7 +92,7 @@ loss_fn:
 
 checkpointing:
   enabled: true
-  checkpoint_dir: checkpoints/context-self-distill-qwen3-8b-3n4g
+  checkpoint_dir: checkpoints/context-self-distill-qwen3-32b-10n4g.v2
   metric_name: val:accuracy
   higher_is_better: true
   keep_top_k: 3
@@ -102,13 +102,13 @@ checkpointing:
   save_consolidated: false
 
 policy:
-  model_name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218
+  model_name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-32B/snapshots/9216db5781bf21249d130ec9da846c4624c16137
   tokenizer:
-    name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218
+    name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-32B/snapshots/9216db5781bf21249d130ec9da846c4624c16137
     chat_template_kwargs: null
-  train_global_batch_size: 4
+  train_global_batch_size: 16  # grad_accum = 16 / (1 MBS * 8 DP) = 2 steps
   train_micro_batch_size: 1
-  generation_batch_size: 1
+  generation_batch_size: 2  # 1 vLLM engine; conservative — 32B KV at 20K seq len is heavy
   logprob_batch_size: 1
   max_total_sequence_length: 20480
   precision: bfloat16
@@ -120,7 +120,7 @@ policy:
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: true
-    tensor_parallel_size: 2
+    tensor_parallel_size: 4  # TP=4 fills 1 node; 8 nodes gives DP=8
     context_parallel_size: 1
     custom_parallel_plan: null
   dynamic_batching:
@@ -135,11 +135,11 @@ policy:
     algorithm: modified_first_fit_decreasing
     sequence_length_round: 64
   max_grad_norm: 1.0
-  make_sequence_length_divisible_by: 4
+  make_sequence_length_divisible_by: 8
   optimizer:
     name: torch.optim.AdamW
     kwargs:
-      lr: 8.0e-6
+      lr: 3.0e-6
       weight_decay: 0.01
       betas: [0.9, 0.999]
       eps: 1.0e-8
@@ -168,10 +168,10 @@ policy:
       async_engine: false
       precision: bfloat16
       kv_cache_dtype: auto
-      tensor_parallel_size: 2
+      tensor_parallel_size: 4  # 1 engine; 32B/4 = 16 GB model/GPU; 0.80 util → ~16 GB KV budget
       pipeline_parallel_size: 1
       expert_parallel_size: 1
-      gpu_memory_utilization: 0.60
+      gpu_memory_utilization: 0.80
       max_model_len: 20480
       enforce_eager: false
       use_deep_gemm: false
@@ -185,13 +185,13 @@ policy:
         num_nodes: 1
 
 teacher:
-  model_name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218
+  model_name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-32B/snapshots/9216db5781bf21249d130ec9da846c4624c16137
   tokenizer:
-    name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218
+    name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-32B/snapshots/9216db5781bf21249d130ec9da846c4624c16137
     chat_template_kwargs: null
-  train_global_batch_size: 4
+  train_global_batch_size: 16
   train_micro_batch_size: 1
-  generation_batch_size: 1
+  generation_batch_size: 2
   logprob_batch_size: 1
   max_total_sequence_length: 20480
   precision: bfloat16
@@ -203,7 +203,7 @@ teacher:
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: true
-    tensor_parallel_size: 2
+    tensor_parallel_size: 4
     context_parallel_size: 1
     custom_parallel_plan: null
   dynamic_batching:
@@ -218,11 +218,11 @@ teacher:
     algorithm: modified_first_fit_decreasing
     sequence_length_round: 64
   max_grad_norm: 1.0
-  make_sequence_length_divisible_by: 4
+  make_sequence_length_divisible_by: 8
   optimizer:
     name: torch.optim.AdamW
     kwargs:
-      lr: 8.0e-6
+      lr: 3.0e-6
       weight_decay: 0.01
       betas: [0.9, 0.999]
       eps: 1.0e-8
@@ -266,7 +266,7 @@ env:
     num_workers: 8
 
 logger:
-  log_dir: logs/context-self-distill-qwen3-8b-3n4g
+  log_dir: logs/context-self-distill-qwen3-32b-10n4g.v2
   num_val_samples_to_print: 5
   wandb_enabled: true
   tensorboard_enabled: true
@@ -275,13 +275,13 @@ logger:
   monitor_gpus: true
   wandb:
     project: nemo-distillation
-    name: context-self-distill-qwen3-8b-3n4g
+    name: context-self-distill-qwen3-32b-10n4g.v2
   tensorboard:
-    log_dir: tb_logs-context-self-distill-qwen3-8b-3n4g
+    log_dir: tb_logs-context-self-distill-qwen3-32b-10n4g.v2
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10
 
 cluster:
   gpus_per_node: 4
-  num_nodes: 3
+  num_nodes: 10  # 8 training + 1 generation + 1 teacher

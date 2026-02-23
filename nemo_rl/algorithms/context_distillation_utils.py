@@ -44,6 +44,7 @@ class ContextDistillationBuildResult:
     alignments: list[ContextDistillationAlignment]
     sample_mask: torch.Tensor
     metrics: dict[str, float]
+    debug_dump_printed: bool
 
 
 def extract_first_think_span(text: str) -> str:
@@ -65,13 +66,17 @@ def _tokenize_text(
     return input_ids.to(dtype=torch.long, device="cpu")
 
 
-def _extract_problem_text(message_log: LLMMessageLogType) -> str:
-    for message in message_log:
-        if message.get("role") == "user":
-            content = message.get("content")
-            if isinstance(content, str):
-                return content
-    raise ValueError("No user message with string content found in message log.")
+def _extract_problem_from_extra_env_info(extra_env_info: Any) -> str:
+    if not isinstance(extra_env_info, dict):
+        raise ValueError(
+            "Context distillation requires extra_env_info to be a dict containing 'problem'."
+        )
+    problem = extra_env_info.get("problem")
+    if not isinstance(problem, str) or not problem.strip():
+        raise ValueError(
+            "Context distillation requires extra_env_info['problem'] to be a non-empty string."
+        )
+    return problem
 
 
 def _extract_last_assistant_payload(
@@ -115,12 +120,14 @@ def build_context_distillation_teacher_batch(
     teacher_prefix_template: str,
     max_teacher_sequence_length: int,
     pad_token_id: int,
+    extra_env_infos: list[dict[str, Any] | None],
     problem_source: str = "original_user_problem",
     trace_extractor_type: str = "think_tag",
     trace_extractor_selection: str = "first",
     missing_trace_policy: str = "empty",
     overflow_policy: str = "truncate_prefix_only",
     metrics_enabled: bool = True,
+    debug_print_first_sample: bool = False,
 ) -> ContextDistillationBuildResult:
     if problem_source != "original_user_problem":
         raise ValueError(f"Unsupported problem_source for V1: {problem_source}")
@@ -136,6 +143,10 @@ def build_context_distillation_teacher_batch(
         raise ValueError(f"Unsupported overflow_policy for V1: {overflow_policy}")
     if max_teacher_sequence_length <= 0:
         raise ValueError("max_teacher_sequence_length must be positive.")
+    if len(extra_env_infos) != len(message_logs):
+        raise ValueError(
+            "extra_env_infos length must match message_logs length for context distillation."
+        )
 
     sample_mask_out = sample_mask.clone()
 
@@ -153,13 +164,52 @@ def build_context_distillation_teacher_batch(
     dropped_too_long_response = 0
     dropped_invalid_message = 0
     dropped_no_prefix_budget = 0
+    debug_dump_printed = False
+
+    if debug_print_first_sample and num_samples > 0:
+        sample0_mask = float(sample_mask[0].item()) if sample_mask.numel() > 0 else float("nan")
+        try:
+            sample0_problem = _extract_problem_from_extra_env_info(extra_env_infos[0])
+            sample0_response_text, _, _ = _extract_last_assistant_payload(message_logs[0])
+            sample0_trace = extract_first_think_span(sample0_response_text)
+            sample0_teacher_context = teacher_prefix_template.format(
+                problem=sample0_problem, trace=sample0_trace
+            )
+            print(
+                (
+                    "\n===== CONTEXT DISTILLATION FIRST-SAMPLE DUMP =====\n"
+                    "sample_idx: 0\n"
+                    f"sample_mask: {sample0_mask}\n\n"
+                    "1) WHOLE STUDENT GENERATION\n"
+                    f"{sample0_response_text}\n\n"
+                    "2) EXTRACTED TRACE\n"
+                    f"{sample0_trace}\n\n"
+                    "3) TEACHER CONTEXT (PROBLEM + EXTRACTED TRACE)\n"
+                    f"{sample0_teacher_context}\n\n"
+                    "4) TEXT THE TEACHER SCORES\n"
+                    f"{sample0_response_text}\n"
+                    "===== END CONTEXT DISTILLATION FIRST-SAMPLE DUMP =====\n"
+                ),
+                flush=True,
+            )
+        except Exception as e:
+            print(
+                (
+                    "\n===== CONTEXT DISTILLATION FIRST-SAMPLE DUMP =====\n"
+                    "Failed to build first-sample dump.\n"
+                    f"error: {e}\n"
+                    "===== END CONTEXT DISTILLATION FIRST-SAMPLE DUMP =====\n"
+                ),
+                flush=True,
+            )
+        debug_dump_printed = True
 
     for sample_idx, message_log in enumerate(message_logs):
         if float(sample_mask_out[sample_idx].item()) == 0.0:
             continue
 
         try:
-            problem = _extract_problem_text(message_log)
+            problem = _extract_problem_from_extra_env_info(extra_env_infos[sample_idx])
             response_text, response_tokens, response_start = _extract_last_assistant_payload(
                 message_log
             )
@@ -280,6 +330,7 @@ def build_context_distillation_teacher_batch(
         alignments=alignments,
         sample_mask=sample_mask_out,
         metrics=metrics,
+        debug_dump_printed=debug_dump_printed,
     )
 
 

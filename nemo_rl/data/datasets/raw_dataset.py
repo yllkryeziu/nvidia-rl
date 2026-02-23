@@ -28,7 +28,7 @@ class RawDataset:
     processor: TaskDataProcessFnCallable
     task_spec: TaskDataSpec
 
-    def split_train_validation(self, test_size: float, seed: int):
+    def split_train_validation(self, test_size: int | float, seed: int):
         if test_size > 0:
             split_dataset = self.dataset.train_test_split(
                 test_size=test_size, seed=seed

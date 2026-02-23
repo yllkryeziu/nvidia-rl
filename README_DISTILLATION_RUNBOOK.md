@@ -201,6 +201,49 @@ COMMAND='uv run python examples/run_distillation.py --config examples/configs/re
 sbatch -N2 --export=ALL,COMMAND="$COMMAND" ray_bare.sub
 ```
 
+### 4.3 16k Context/Self-Distillation on OpenThoughts-114k (3x4 GPUs, W&B enabled)
+
+These recipes are preconfigured for:
+- student generation `max_new_tokens=16384`
+- teacher/student max sequence length `20480`
+- train dataset `open-thoughts/OpenThoughts-114k` (`subset=metadata`, `input_key=problem`)
+- `wandb_enabled=true`
+
+Run (`1.7B -> 1.7B`):
+
+```bash
+COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/context-self-distill-qwen3-1p7b-3n4g.v1.yaml'
+sbatch -N3 --export=ALL,COMMAND="$COMMAND" ray_bare.sub
+```
+
+Run (`4B -> 4B`):
+
+```bash
+COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/context-self-distill-qwen3-4b-3n4g.v1.yaml'
+sbatch -N4 --export=ALL,COMMAND="$COMMAND" ray_bare.sub
+```
+
+Note: 4B self-distillation requires 4 nodes (training cluster gets 2 nodes for DP=2×TP=4).
+Config `context-self-distill-qwen3-4b-3n4g.v1.yaml` already encodes `cluster.num_nodes=4` and
+`resource_isolation.roles.training.num_nodes=2`, so no overrides needed.
+
+Run (`8B -> 8B`):
+
+```bash
+COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/context-self-distill-qwen3-8b-3n4g.v1.yaml'
+sbatch -N3 --export=ALL,COMMAND="$COMMAND" ray_bare.sub
+```
+
+Run (`14B -> 14B`):
+
+```bash
+COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/context-self-distill-qwen3-14b-3n4g.v1.yaml'
+sbatch -N3 --export=ALL,COMMAND="$COMMAND" ray_bare.sub
+```
+
+W&B note:
+- Ensure `WANDB_API_KEY` is available in the job environment before `sbatch`.
+
 Important V1 constraints for context/self-distillation:
 - `distillation.max_rollout_turns` must be `1`
 - `policy.model_name` must equal `teacher.model_name`
@@ -283,7 +326,7 @@ Current V1 implementation:
 
 Before scaling up, verify all items:
 1. Smoke tests pass (unit + short training).
-2. `cluster.num_nodes` and Slurm `sbatch -N` match.
+2. `cluster.num_nodes` and Slurm `sbatch -N` match. For isolated runs: `cluster.num_nodes` = sum of all role `num_nodes` (e.g. 4B self-distill: training=2 + generation=1 + teacher=1 = 4).
 3. `cluster.gpus_per_node` matches actual GPUs per node.
 4. `policy.max_total_sequence_length` and `teacher.max_total_sequence_length` fit memory.
 5. `policy.dtensor_cfg.tensor_parallel_size` and `context_parallel_size` are valid for your node topology.

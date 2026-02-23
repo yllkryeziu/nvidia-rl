@@ -319,9 +319,10 @@ def math_data_processor(
     idx: int,
 ) -> DatumSpec:
     """Process a datum dictionary (directly loaded from dataset) into a DatumSpec for the Math Environment."""
-    problem = datum_dict["problem"]
+    raw_problem = datum_dict["problem"]
+    problem = raw_problem
     solution = str(datum_dict["expected_answer"])
-    extra_env_info = {"ground_truth": solution}
+    extra_env_info = {"ground_truth": solution, "problem": raw_problem}
 
     message_log: LLMMessageLogType = []
 
@@ -390,8 +391,9 @@ def math_hf_data_processor(
 ) -> DatumSpec:
     """Process a datum dictionary (directly loaded from data/hf_datasets/openmathinstruct2.py) into a DatumSpec for the Reward Model Environment."""
     user_message = datum_dict["messages"]
-    problem = user_message[0]["content"]
-    extra_env_info = {"ground_truth": user_message[1]["content"]}
+    raw_problem = user_message[0]["content"]
+    problem = raw_problem
+    extra_env_info = {"ground_truth": user_message[1]["content"], "problem": raw_problem}
 
     message_log: LLMMessageLogType = []
     formatted_content = (

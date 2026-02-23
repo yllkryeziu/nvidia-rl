@@ -28,9 +28,11 @@ class ResponseDatasetConfig(TypedDict):
     processor: NotRequired[str]  # remove once processor is refactored
     download_dir: NotRequired[str]
     # Size of the validation data
-    split_validation_size: NotRequired[float]
+    split_validation_size: NotRequired[int | float]
     # Seed for train/validation split when split_validation_size > 0
     seed: NotRequired[int]
+    filter_column: NotRequired[str]
+    filter_value: NotRequired[str | int | float | bool]
 
 
 class PreferenceDatasetConfig(TypedDict):

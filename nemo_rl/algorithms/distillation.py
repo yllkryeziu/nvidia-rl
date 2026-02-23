@@ -30,6 +30,7 @@ from nemo_rl.algorithms.loss_functions import (
     DistillationLossFn,
 )
 from nemo_rl.algorithms.context_distillation_utils import (
+    ContextDistillationBuildResult,
     align_teacher_topk_to_student_positions,
     build_context_distillation_teacher_batch,
 )
@@ -96,6 +97,18 @@ class ContextDistillationConfig(TypedDict):
     metrics: ContextDistillationMetricsConfig
 
 
+class ContextDistillationRuntimeConfig(TypedDict):
+    enabled: bool
+    problem_source: str
+    teacher_prefix_template: str
+    trace_type: str
+    trace_selection: str
+    missing_trace_policy: str
+    overflow_policy: str
+    metrics_enabled: bool
+    teacher_max_sequence_length: int
+
+
 class DistillationRoleResourcesConfig(TypedDict):
     num_nodes: int
     gpus_per_node: int
@@ -127,6 +140,7 @@ class DistillationConfig(TypedDict):
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
     val_at_end: bool
     max_val_samples: int
+    val_track_train_metrics: NotRequired[bool]
     topk_logits_k: int
     seed: int
     context_distillation: NotRequired[ContextDistillationConfig]
@@ -152,6 +166,265 @@ def _default_distillation_save_state() -> DistillationSaveState:
         "val_reward": -99999999.0,  # Aligned with GRPO
         "consumed_samples": 0,
         "total_valid_tokens": 0,
+    }
+
+
+def _get_data_parallel_size(policy: ColocatablePolicyInterface) -> int:
+    """Best-effort retrieval of policy data parallel size."""
+    sharding_annotations = getattr(policy, "sharding_annotations", None)
+    if sharding_annotations is None:
+        return 1
+    try:
+        return int(sharding_annotations.get_axis_size("data_parallel"))
+    except Exception:
+        return 1
+
+
+def _make_context_teacher_batch_dp_compatible(
+    *,
+    context_batch: ContextDistillationBuildResult,
+    teacher_dp_size: int,
+) -> int:
+    """Trim context teacher batch so its size is divisible by teacher DP size.
+
+    Returns number of samples dropped from the context teacher batch.
+    """
+    if teacher_dp_size <= 1 or context_batch.teacher_data is None:
+        return 0
+
+    teacher_batch_size = int(context_batch.teacher_data["input_ids"].shape[0])
+    remainder = teacher_batch_size % teacher_dp_size
+    if remainder == 0:
+        return 0
+
+    keep_count = teacher_batch_size - remainder
+    dropped_sample_indices = context_batch.valid_sample_indices[keep_count:]
+    for sample_idx in dropped_sample_indices:
+        context_batch.sample_mask[sample_idx] = 0.0
+
+    if keep_count <= 0:
+        context_batch.teacher_data = None
+        context_batch.valid_sample_indices = []
+        context_batch.alignments = []
+        return teacher_batch_size
+
+    context_batch.teacher_data = BatchedDataDict(
+        {
+            "input_ids": context_batch.teacher_data["input_ids"][:keep_count],
+            "input_lengths": context_batch.teacher_data["input_lengths"][:keep_count],
+        }
+    )
+    context_batch.valid_sample_indices = context_batch.valid_sample_indices[:keep_count]
+    context_batch.alignments = context_batch.alignments[:keep_count]
+    return remainder
+
+
+_MEAN_REDUCED_METRICS = {
+    "lr",
+    "wd",
+    "global_valid_seqs",
+    "global_valid_toks",
+    "mean_prompt_length",
+}
+
+
+def _to_numpy_array(value: Any) -> np.ndarray:
+    if torch.is_tensor(value):
+        return value.detach().cpu().numpy()
+    if isinstance(value, np.ndarray):
+        return value
+    return np.asarray(value)
+
+
+def _reduce_metric(value: Any, *, use_mean: bool) -> float:
+    arr = _to_numpy_array(value)
+    if arr.size == 0:
+        return 0.0
+    if use_mean:
+        return float(np.mean(arr))
+    return float(np.sum(arr))
+
+
+def _build_train_data_from_rollout(
+    *,
+    repeated_batch: BatchedDataDict[DatumSpec],
+    tokenizer,
+    make_sequence_length_divisible_by: int,
+) -> tuple[BatchedDataDict[DistillationLossDataDict], BatchedDataDict[Any], torch.Tensor]:
+    # Mark assistant tokens for loss and non-assistant tokens as masked out.
+    for message_log in repeated_batch["message_log"]:
+        for message in message_log:
+            if message["role"] == "assistant":
+                message["token_loss_mask"] = torch.ones_like(message["token_ids"])
+            else:
+                message["token_loss_mask"] = torch.zeros_like(message["token_ids"])
+
+    flat_messages, input_lengths = batched_message_log_to_flat_message(
+        repeated_batch["message_log"],
+        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+        make_sequence_length_divisible_by=make_sequence_length_divisible_by,
+    )
+
+    train_data = BatchedDataDict[DistillationLossDataDict](
+        {
+            "input_ids": flat_messages["token_ids"],
+            "input_lengths": input_lengths,
+            "token_mask": flat_messages["token_loss_mask"],
+            "sample_mask": repeated_batch["loss_multiplier"],
+        }
+    )
+    # Keep packed multimodal entries so policy microbatching can handle them.
+    train_data.update(flat_messages.get_multimodal_dict(as_tensors=False))
+    train_data.to("cpu")
+    return train_data, flat_messages, input_lengths
+
+
+def _get_required_extra_env_infos(
+    repeated_batch: BatchedDataDict[DatumSpec],
+) -> list[dict[str, Any] | None]:
+    extra_env_infos = repeated_batch.get("extra_env_info")
+    if not isinstance(extra_env_infos, list):
+        raise ValueError(
+            "Context distillation requires batched 'extra_env_info' with raw 'problem'."
+        )
+    if len(extra_env_infos) != len(repeated_batch["message_log"]):
+        raise ValueError(
+            "extra_env_info length must match message_log length for context distillation."
+        )
+    return cast(list[dict[str, Any] | None], extra_env_infos)
+
+
+def _populate_teacher_topk_for_train_data(
+    *,
+    train_data: BatchedDataDict[DistillationLossDataDict],
+    repeated_batch: BatchedDataDict[DatumSpec],
+    extra_env_infos: list[dict[str, Any] | None],
+    teacher_policy: ColocatablePolicyInterface,
+    tokenizer,
+    topk_k: int,
+    timer: Optional[Timer],
+    context_runtime_cfg: ContextDistillationRuntimeConfig,
+    teacher_dp_size: int,
+    debug_print_first_sample: bool,
+) -> tuple[dict[str, float], bool]:
+    context_step_metrics: dict[str, float] = {}
+    debug_dump_printed = False
+    if context_runtime_cfg["enabled"]:
+        context_batch = build_context_distillation_teacher_batch(
+            message_logs=repeated_batch["message_log"],
+            sample_mask=train_data["sample_mask"],
+            student_input_lengths=train_data["input_lengths"],
+            extra_env_infos=extra_env_infos,
+            tokenizer=tokenizer,
+            teacher_prefix_template=context_runtime_cfg["teacher_prefix_template"],
+            max_teacher_sequence_length=context_runtime_cfg[
+                "teacher_max_sequence_length"
+            ],
+            pad_token_id=tokenizer.pad_token_id,
+            problem_source=context_runtime_cfg["problem_source"],
+            trace_extractor_type=context_runtime_cfg["trace_type"],
+            trace_extractor_selection=context_runtime_cfg["trace_selection"],
+            missing_trace_policy=context_runtime_cfg["missing_trace_policy"],
+            overflow_policy=context_runtime_cfg["overflow_policy"],
+            metrics_enabled=context_runtime_cfg["metrics_enabled"],
+            debug_print_first_sample=debug_print_first_sample,
+        )
+        debug_dump_printed = context_batch.debug_dump_printed
+        train_data["sample_mask"] = context_batch.sample_mask
+        context_step_metrics = context_batch.metrics
+        dropped_for_dp_divisibility = _make_context_teacher_batch_dp_compatible(
+            context_batch=context_batch,
+            teacher_dp_size=teacher_dp_size,
+        )
+        if dropped_for_dp_divisibility > 0:
+            train_data["sample_mask"] = context_batch.sample_mask
+            context_step_metrics["context_distillation_dropped_for_dp_divisibility"] = (
+                float(dropped_for_dp_divisibility)
+            )
+
+        batch_size, student_seq_len = train_data["input_ids"].shape[:2]
+        if context_batch.teacher_data is None:
+            train_data["teacher_topk_logits"] = torch.zeros(
+                (batch_size, student_seq_len, topk_k),
+                dtype=torch.float32,
+            )
+            train_data["teacher_topk_indices"] = torch.zeros(
+                (batch_size, student_seq_len, topk_k),
+                dtype=torch.long,
+            )
+        else:
+            teacher_topk = teacher_policy.get_topk_logits(
+                context_batch.teacher_data,
+                k=topk_k,
+                timer=timer,
+            )
+            aligned_logits, aligned_indices = align_teacher_topk_to_student_positions(
+                teacher_topk_logits=teacher_topk["topk_logits"],
+                teacher_topk_indices=teacher_topk["topk_indices"],
+                alignments=context_batch.alignments,
+                valid_sample_indices=context_batch.valid_sample_indices,
+                student_batch_size=batch_size,
+                student_sequence_length=student_seq_len,
+                topk=topk_k,
+            )
+            train_data["teacher_topk_logits"] = aligned_logits
+            train_data["teacher_topk_indices"] = aligned_indices
+    else:
+        teacher_topk = teacher_policy.get_topk_logits(
+            train_data,
+            k=topk_k,
+            timer=timer,
+        )
+        train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
+        train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
+
+    return context_step_metrics, debug_dump_printed
+
+
+def _finalize_distillation_step_metrics(
+    *,
+    train_results: dict[str, Any],
+    repeated_batch: BatchedDataDict[DatumSpec],
+    input_lengths: torch.Tensor,
+    rollout_metrics: dict[str, Any],
+    context_step_metrics: dict[str, float],
+) -> dict[str, Any]:
+    raw_metrics: dict[str, Any] = {
+        "loss": train_results["loss"],
+        "mean_prompt_length": repeated_batch["length"],
+        "total_num_tokens": input_lengths,
+    }
+    grad_norm_value = train_results.get("grad_norm")
+    raw_metrics["grad_norm"] = (
+        np.asarray([np.nan], dtype=np.float32)
+        if grad_norm_value is None
+        else grad_norm_value
+    )
+    raw_metrics.update(train_results["all_mb_metrics"])
+
+    metrics: dict[str, float] = {}
+    for key, value in raw_metrics.items():
+        metrics[key] = _reduce_metric(value, use_mean=key in _MEAN_REDUCED_METRICS)
+
+    metrics.update(rollout_metrics)
+    metrics.update(context_step_metrics)
+    return metrics
+
+
+def _mean_aggregate_metric_dicts(metric_dicts: list[dict[str, Any]]) -> dict[str, float]:
+    if not metric_dicts:
+        return {}
+
+    per_key_values: dict[str, list[float]] = {}
+    for metrics in metric_dicts:
+        for key, value in metrics.items():
+            if not isinstance(value, (int, float, np.number)):
+                continue
+            per_key_values.setdefault(key, []).append(float(value))
+
+    return {
+        key: float(np.mean(values)) if len(values) > 0 else 0.0
+        for key, values in per_key_values.items()
     }
 
 
@@ -761,7 +1034,8 @@ def distillation_train(
     context_trace_selection = "first"
     context_missing_trace_policy = "empty"
     context_overflow_policy = "truncate_prefix_only"
-    context_teacher_max_seq_len = master_config["teacher"].get(
+    context_first_sample_dump_pending = context_distillation_enabled
+    context_teacher_max_sequence_length = master_config["teacher"].get(
         "max_total_sequence_length",
         master_config["policy"]["max_total_sequence_length"],
     )
@@ -771,6 +1045,25 @@ def distillation_train(
         and resource_isolation_cfg.get("enabled", False)
         and resource_isolation_cfg.get("teacher_resident_on_gpu", True)
     )
+    student_dp_size = _get_data_parallel_size(student_policy)
+    teacher_dp_size = _get_data_parallel_size(teacher_policy)
+    expected_step_batch_size = (
+        master_config["distillation"]["num_prompts_per_step"]
+        * master_config["distillation"]["num_generations_per_prompt"]
+    )
+    configured_train_gbs = master_config["policy"]["train_global_batch_size"]
+    if configured_train_gbs % max(student_dp_size, 1) != 0:
+        raise ValueError(
+            "policy.train_global_batch_size must be divisible by student data_parallel size. "
+            f"Got train_global_batch_size={configured_train_gbs}, data_parallel={student_dp_size}."
+        )
+    if expected_step_batch_size % max(student_dp_size, 1) != 0:
+        raise ValueError(
+            "distillation step batch must be divisible by student data_parallel size. "
+            "Set distillation.num_prompts_per_step * distillation.num_generations_per_prompt "
+            "to a multiple of DP. "
+            f"Got step_batch={expected_step_batch_size}, data_parallel={student_dp_size}."
+        )
 
     if context_distillation_enabled:
         assert context_distillation_cfg is not None
@@ -804,6 +1097,18 @@ def distillation_train(
         context_metrics_cfg = context_distillation_cfg.get("metrics", {})
         context_metrics_enabled = context_metrics_cfg.get("enabled", True)
 
+    context_runtime_cfg: ContextDistillationRuntimeConfig = {
+        "enabled": context_distillation_enabled,
+        "problem_source": context_problem_source,
+        "teacher_prefix_template": context_teacher_prefix_template,
+        "trace_type": context_trace_type,
+        "trace_selection": context_trace_selection,
+        "missing_trace_policy": context_missing_trace_policy,
+        "overflow_policy": context_overflow_policy,
+        "metrics_enabled": context_metrics_enabled,
+        "teacher_max_sequence_length": context_teacher_max_sequence_length,
+    }
+
     if teacher_should_stay_resident:
         print(
             "▶ Preparing teacher logprob inference once (resident mode)...",
@@ -832,6 +1137,12 @@ def distillation_train(
                 val_task_to_env,
                 step=total_steps,
                 master_config=master_config,
+                student_policy=student_policy,
+                teacher_policy=teacher_policy,
+                loss_fn=loss_fn,
+                teacher_should_stay_resident=teacher_should_stay_resident,
+                teacher_dp_size=teacher_dp_size,
+                context_runtime_cfg=context_runtime_cfg,
             )
             student_generation.finish_generation()
             logger.log_metrics(val_metrics, total_steps, prefix="validation")
@@ -920,42 +1231,15 @@ def distillation_train(
                         student_generation.finish_generation()
 
                     with timer.time("data_processing"):
-                        # Add loss mask and advantages to each message in LLMMessageLogType
-                        for message_log in repeated_batch["message_log"]:
-                            for message in message_log:
-                                if message["role"] == "assistant":
-                                    message["token_loss_mask"] = torch.ones_like(
-                                        message["token_ids"]
-                                    )
-                                else:
-                                    message["token_loss_mask"] = torch.zeros_like(
-                                        message["token_ids"]
-                                    )
-
-                        # Convert updated LLMMessageLogType to FlatMessagesType for training
-                        flat_messages, input_lengths = batched_message_log_to_flat_message(
-                            repeated_batch["message_log"],
-                            pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                            make_sequence_length_divisible_by=master_config["policy"][
-                                "make_sequence_length_divisible_by"
-                            ],
+                        train_data, flat_messages, input_lengths = (
+                            _build_train_data_from_rollout(
+                                repeated_batch=repeated_batch,
+                                tokenizer=tokenizer,
+                                make_sequence_length_divisible_by=master_config[
+                                    "policy"
+                                ]["make_sequence_length_divisible_by"],
+                            )
                         )
-
-                        # Create training data from flattened messages
-                        train_data = BatchedDataDict[DistillationLossDataDict](
-                            {
-                                "input_ids": flat_messages["token_ids"],
-                                "input_lengths": input_lengths,
-                                "token_mask": flat_messages["token_loss_mask"],
-                                "sample_mask": repeated_batch["loss_multiplier"],
-                            }
-                        )
-                        # this will be mini-batched inside the policy, so maintain the packed multimodal structure
-                        train_data.update(
-                            flat_messages.get_multimodal_dict(as_tensors=False)
-                        )
-                        train_data.to("cpu")
-                        context_step_metrics: dict[str, float] = {}
 
                     print("▶ Preparing for teacher logprob inference...", flush=True)
                     with timer.time("teacher_logprob_inference_prep"):
@@ -964,69 +1248,23 @@ def distillation_train(
 
                     print("▶ Computing teacher logprobs...", flush=True)
                     with timer.time("teacher_logprob_inference"):
-                        topk_k = master_config["distillation"]["topk_logits_k"]
-                        if context_distillation_enabled:
-                            context_batch = build_context_distillation_teacher_batch(
-                                message_logs=repeated_batch["message_log"],
-                                sample_mask=train_data["sample_mask"],
-                                student_input_lengths=train_data["input_lengths"],
+                        extra_env_infos = _get_required_extra_env_infos(repeated_batch)
+                        context_step_metrics, debug_dump_printed = (
+                            _populate_teacher_topk_for_train_data(
+                                train_data=train_data,
+                                repeated_batch=repeated_batch,
+                                extra_env_infos=extra_env_infos,
+                                teacher_policy=teacher_policy,
                                 tokenizer=tokenizer,
-                                teacher_prefix_template=context_teacher_prefix_template,
-                                max_teacher_sequence_length=context_teacher_max_seq_len,
-                                pad_token_id=tokenizer.pad_token_id,
-                                problem_source=context_problem_source,
-                                trace_extractor_type=context_trace_type,
-                                trace_extractor_selection=context_trace_selection,
-                                missing_trace_policy=context_missing_trace_policy,
-                                overflow_policy=context_overflow_policy,
-                                metrics_enabled=context_metrics_enabled,
-                            )
-                            train_data["sample_mask"] = context_batch.sample_mask
-                            context_step_metrics = context_batch.metrics
-
-                            batch_size, student_seq_len = train_data[
-                                "input_ids"
-                            ].shape[:2]
-                            if context_batch.teacher_data is None:
-                                train_data["teacher_topk_logits"] = torch.zeros(
-                                    (batch_size, student_seq_len, topk_k),
-                                    dtype=torch.float32,
-                                )
-                                train_data["teacher_topk_indices"] = torch.zeros(
-                                    (batch_size, student_seq_len, topk_k),
-                                    dtype=torch.long,
-                                )
-                            else:
-                                teacher_topk = teacher_policy.get_topk_logits(
-                                    context_batch.teacher_data,
-                                    k=topk_k,
-                                    timer=timer,
-                                )
-                                aligned_logits, aligned_indices = (
-                                    align_teacher_topk_to_student_positions(
-                                        teacher_topk_logits=teacher_topk["topk_logits"],
-                                        teacher_topk_indices=teacher_topk["topk_indices"],
-                                        alignments=context_batch.alignments,
-                                        valid_sample_indices=context_batch.valid_sample_indices,
-                                        student_batch_size=batch_size,
-                                        student_sequence_length=student_seq_len,
-                                        topk=topk_k,
-                                    )
-                                )
-                                train_data["teacher_topk_logits"] = aligned_logits
-                                train_data["teacher_topk_indices"] = aligned_indices
-                        else:
-                            teacher_topk = teacher_policy.get_topk_logits(
-                                train_data,
-                                k=topk_k,
+                                topk_k=master_config["distillation"]["topk_logits_k"],
                                 timer=timer,
+                                context_runtime_cfg=context_runtime_cfg,
+                                teacher_dp_size=teacher_dp_size,
+                                debug_print_first_sample=context_first_sample_dump_pending,
                             )
-                            train_data["teacher_topk_logits"] = teacher_topk[
-                                "topk_logits"
-                            ]
-                            train_data["teacher_topk_indices"] = teacher_topk[
-                                "topk_indices"
-                            ]
+                        )
+                        if debug_dump_printed:
+                            context_first_sample_dump_pending = False
 
                     print("▶ Preparing for training...", flush=True)
                     with timer.time("training_prep"):
@@ -1067,6 +1305,12 @@ def distillation_train(
                             val_task_to_env,
                             step=total_steps + 1,
                             master_config=master_config,
+                            student_policy=student_policy,
+                            teacher_policy=teacher_policy,
+                            loss_fn=loss_fn,
+                            teacher_should_stay_resident=teacher_should_stay_resident,
+                            teacher_dp_size=teacher_dp_size,
+                            context_runtime_cfg=context_runtime_cfg,
                         )
                         student_generation.finish_generation()
                         logger.log_metrics(
@@ -1076,27 +1320,14 @@ def distillation_train(
                             val_metrics, total_steps + 1, prefix="validation"
                         )
 
-                    metrics = {
-                        "loss": train_results["loss"].numpy(),
-                        "grad_norm": train_results["grad_norm"].numpy(),
-                        "mean_prompt_length": repeated_batch["length"].numpy(),
-                        "total_num_tokens": input_lengths.numpy(),
-                    }
-                    metrics.update(train_results["all_mb_metrics"])
-                    for k, v in metrics.items():
-                        if k in {
-                            "lr",
-                            "wd",
-                            "global_valid_seqs",
-                            "global_valid_toks",
-                            "mean_prompt_length",
-                        }:
-                            metrics[k] = np.mean(v).item()
-                        else:
-                            metrics[k] = np.sum(v).item()
-                    metrics.update(rollout_metrics)
-                    metrics.update(context_step_metrics)
-                    total_valid_tokens += metrics["global_valid_toks"]
+                    metrics = _finalize_distillation_step_metrics(
+                        train_results=train_results,
+                        repeated_batch=repeated_batch,
+                        input_lengths=input_lengths,
+                        rollout_metrics=rollout_metrics,
+                        context_step_metrics=context_step_metrics,
+                    )
+                    total_valid_tokens += metrics.get("global_valid_toks", 0.0)
 
                     ## Checkpointing
                     consumed_samples += master_config["distillation"][
@@ -1289,6 +1520,12 @@ def validate(
     val_task_to_env: Optional[dict[str, EnvironmentInterface]],
     step: int,
     master_config: MasterConfig,
+    student_policy: Optional[ColocatablePolicyInterface] = None,
+    teacher_policy: Optional[ColocatablePolicyInterface] = None,
+    loss_fn: Optional[DistillationLossFn] = None,
+    teacher_should_stay_resident: bool = False,
+    teacher_dp_size: int = 1,
+    context_runtime_cfg: Optional[ContextDistillationRuntimeConfig] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run validation on the validation dataset."""
     if val_dataloader is None:
@@ -1302,21 +1539,87 @@ def validate(
         )
         return {}, {}
 
+    track_train_metrics = bool(
+        master_config["distillation"].get("val_track_train_metrics", False)
+    )
+    if track_train_metrics:
+        if student_policy is None or teacher_policy is None or loss_fn is None:
+            raise ValueError(
+                "Validation train-metric tracking requires student_policy, "
+                "teacher_policy, and loss_fn."
+            )
+        if context_runtime_cfg is None:
+            context_distillation_cfg = master_config["distillation"].get(
+                "context_distillation"
+            )
+            trace_cfg = (
+                context_distillation_cfg.get("trace_extractor", {})
+                if context_distillation_cfg
+                else {}
+            )
+            metrics_cfg = (
+                context_distillation_cfg.get("metrics", {})
+                if context_distillation_cfg
+                else {}
+            )
+            context_runtime_cfg = {
+                "enabled": bool(
+                    context_distillation_cfg
+                    and context_distillation_cfg.get("enabled", False)
+                ),
+                "problem_source": (
+                    context_distillation_cfg.get(
+                        "problem_source", "original_user_problem"
+                    )
+                    if context_distillation_cfg
+                    else "original_user_problem"
+                ),
+                "teacher_prefix_template": (
+                    context_distillation_cfg.get(
+                        "teacher_prefix_template",
+                        "You are given a problem and a trace: {problem} + {trace}. Solve it on your own.",
+                    )
+                    if context_distillation_cfg
+                    else "You are given a problem and a trace: {problem} + {trace}. Solve it on your own."
+                ),
+                "trace_type": trace_cfg.get("type", "think_tag"),
+                "trace_selection": trace_cfg.get("selection", "first"),
+                "missing_trace_policy": trace_cfg.get("missing_trace_policy", "empty"),
+                "overflow_policy": (
+                    context_distillation_cfg.get(
+                        "overflow_policy", "truncate_prefix_only"
+                    )
+                    if context_distillation_cfg
+                    else "truncate_prefix_only"
+                ),
+                "metrics_enabled": metrics_cfg.get("enabled", True),
+                "teacher_max_sequence_length": master_config["teacher"].get(
+                    "max_total_sequence_length",
+                    master_config["policy"]["max_total_sequence_length"],
+                ),
+            }
+
+    max_val_samples = master_config["distillation"]["max_val_samples"]
     timer = Timer()
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...", flush=True)
 
         total_rewards = []  # Can be any metric. Setted to 'accuracy' by default.
-        total_lengths = []
+        total_generated_tokens = 0.0
         all_message_logs = []  # Collect all message logs
+        distill_validation_metrics_by_batch: list[dict[str, Any]] = []
 
-        max_batches = (
-            master_config["distillation"]["max_val_samples"]
-            // master_config["distillation"]["val_batch_size"]
-        )
-        for batch_idx, val_batch in enumerate(val_dataloader):
-            if batch_idx >= max_batches:
+        if track_train_metrics and not teacher_should_stay_resident:
+            assert teacher_policy is not None
+            with timer.time("validation_teacher_logprob_inference_prep"):
+                teacher_policy.prepare_for_lp_inference()
+
+        for val_batch in val_dataloader:
+            remaining_samples = max_val_samples - len(total_rewards)
+            if remaining_samples <= 0:
                 break
+            if val_batch.size > remaining_samples:
+                val_batch = val_batch.slice(0, remaining_samples)
 
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
             # Use async rollouts if vLLM async engine is enabled
@@ -1345,9 +1648,12 @@ def validate(
                     greedy=False,
                 )
             rewards = val_batch["total_reward"]
+            batch_size = len(rewards)
 
             total_rewards.extend(rewards.tolist())
-            total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
+            total_generated_tokens += (
+                float(gen_metrics["mean_gen_tokens_per_sample"]) * batch_size
+            )
 
             # Collect message logs for later display
             to_env = [
@@ -1359,18 +1665,77 @@ def validate(
 
             all_message_logs.extend(to_env)
 
+            if track_train_metrics:
+                assert student_policy is not None
+                assert teacher_policy is not None
+                assert loss_fn is not None
+                assert context_runtime_cfg is not None
+
+                with timer.time("validation_data_processing"):
+                    val_train_data, _, val_input_lengths = _build_train_data_from_rollout(
+                        repeated_batch=val_batch,
+                        tokenizer=tokenizer,
+                        make_sequence_length_divisible_by=master_config["policy"][
+                            "make_sequence_length_divisible_by"
+                        ],
+                    )
+
+                with timer.time("validation_teacher_logprob_inference"):
+                    val_extra_env_infos = _get_required_extra_env_infos(val_batch)
+                    val_context_step_metrics, _ = _populate_teacher_topk_for_train_data(
+                        train_data=val_train_data,
+                        repeated_batch=val_batch,
+                        extra_env_infos=val_extra_env_infos,
+                        teacher_policy=teacher_policy,
+                        tokenizer=tokenizer,
+                        topk_k=master_config["distillation"]["topk_logits_k"],
+                        timer=timer,
+                        context_runtime_cfg=context_runtime_cfg,
+                        teacher_dp_size=teacher_dp_size,
+                        debug_print_first_sample=False,
+                    )
+
+                with timer.time("validation_policy_training"):
+                    student_policy.prepare_for_training()
+                    val_train_results = student_policy.train(
+                        val_train_data,
+                        loss_fn,
+                        eval_mode=True,
+                        timer=timer,
+                    )
+
+                val_step_metrics = _finalize_distillation_step_metrics(
+                    train_results=val_train_results,
+                    repeated_batch=val_batch,
+                    input_lengths=val_input_lengths,
+                    rollout_metrics=gen_metrics,
+                    context_step_metrics=val_context_step_metrics,
+                )
+                distill_validation_metrics_by_batch.append(val_step_metrics)
+
+                if policy_generation is student_policy:
+                    with timer.time("validation_prepare_for_generation"):
+                        policy_generation.prepare_for_generation()
+
+        if track_train_metrics and not teacher_should_stay_resident:
+            assert teacher_policy is not None
+            with timer.time("validation_teacher_offload"):
+                teacher_policy.offload_after_refit()
+
         # Calculate validation metrics
         accuracy = (
             sum(total_rewards) / len(total_rewards) if len(total_rewards) > 0 else 0
         )
-        avg_length = (
-            sum(total_lengths) / len(total_lengths) if len(total_lengths) > 0 else 0
-        )
+        avg_length = total_generated_tokens / len(total_rewards) if total_rewards else 0
 
         val_metrics = {
             "accuracy": accuracy,
             "avg_length": avg_length,
         }
+        if track_train_metrics:
+            val_metrics.update(
+                _mean_aggregate_metric_dicts(distill_validation_metrics_by_batch)
+            )
 
         # Print sample conversations only once at the end of validation
         try:
@@ -1396,6 +1761,8 @@ def validate(
     print(f"    • Accuracy: {accuracy:.4f}")
     print(f"    • Average response length: {avg_length:.1f} tokens")
     print(f"    • Samples processed: {len(total_rewards)}", flush=True)
+    if track_train_metrics and "loss" in val_metrics:
+        print(f"    • Distillation loss: {val_metrics['loss']:.4f}", flush=True)
 
     # Print timing information
     print("\n  ⏱️  Validation Timing:")
