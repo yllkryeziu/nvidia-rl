@@ -3,9 +3,9 @@
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
-#SBATCH --time=02:00:00
+#SBATCH --time=6:00:00
 #SBATCH --output=%x-%j.out
-#SBATCH --partition=develbooster
+#SBATCH --partition=booster
 #SBATCH --account=envcomp
 
 set -euo pipefail

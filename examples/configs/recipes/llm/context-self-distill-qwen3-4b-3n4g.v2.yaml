@@ -8,7 +8,7 @@ distillation:
   val_period: 50
   val_at_start: false
   val_at_end: true
-  max_val_samples: 50
+  max_val_samples: 64
   val_track_train_metrics: true
   topk_logits_k: 64
   seed: 42
@@ -49,7 +49,7 @@ distillation:
       Preserve and reuse original reasoning steps wherever possible. When you must add text, imitate the original's style closely. Explore several different paths of reasoning like the original if the problem difficulty demands that.
 
       ### OUTPUT RULES:
-      - Your output has to have a clear, step-by-step summary that walks through the key steps taken to arrive at the answer. This summary should:
+      - After thinking, end with the closing thinking tag, then your output has to have a clear, step-by-step summary that walks through the key steps taken to arrive at the answer. This summary should:
           - Don't write step-by-step summary anywhere
           - Present the logical progression in clean, readable steps (not the raw internal monologue)
           - Conclude with the final answer in the same format as the original (e.g., \boxed{{}})
@@ -253,7 +253,7 @@ data:
     split: train
     filter_column: domain
     filter_value: math
-    split_validation_size: 50
+    split_validation_size: 64
     seed: 42
     input_key: problem
     output_key: ground_truth_solution
