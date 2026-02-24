@@ -1,10 +1,10 @@
 distillation:
-  num_prompts_per_step: 16
+  num_prompts_per_step: 32
   num_generations_per_prompt: 1
   max_rollout_turns: 1
   max_num_steps: 1000
   max_num_epochs: 1
-  val_batch_size: 4
+  val_batch_size: 16
   val_period: 50
   val_at_start: false
   val_at_end: true
@@ -16,6 +16,9 @@ distillation:
     enabled: true
     mode: self_frozen
     problem_source: original_user_problem
+    trace_source: static_dataset
+    static_trace:
+      answer_column: qwen3_1b7_original_answer
     teacher_prefix_template: |
       ### TASK
       You will receive an input containing two parts: a **problem statement** and a **reasoning trace** (an authentic, detailed internal monologue of someone working through the problem).
@@ -68,7 +71,7 @@ distillation:
     trace_extractor:
       type: think_tag
       selection: first
-      missing_trace_policy: empty
+      missing_trace_policy: drop_sample
     metrics:
       enabled: true
   resource_isolation:
@@ -107,7 +110,7 @@ policy:
     name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-14B/snapshots/40c069824f4251a91eefaf281ebe4c544efd3e18
     chat_template_kwargs:
       enable_thinking: true
-  train_global_batch_size: 16  # grad_accum = 16 / (1 MBS * 4 DP) = 4 steps
+  train_global_batch_size: 32  # grad_accum = 32 / (1 MBS * 4 DP) = 8 steps
   train_micro_batch_size: 1
   generation_batch_size: 4  # 1 vLLM engine, conservative for KV cache at 20K seq len
   logprob_batch_size: 1
@@ -125,12 +128,12 @@ policy:
     context_parallel_size: 1
     custom_parallel_plan: null
   dynamic_batching:
-    enabled: true
+    enabled: false
     train_mb_tokens: 20480
     logprob_mb_tokens: 20480
     sequence_length_round: 64
   sequence_packing:
-    enabled: false
+    enabled: true
     train_mb_tokens: 20480
     logprob_mb_tokens: 20480
     algorithm: modified_first_fit_decreasing
@@ -156,11 +159,11 @@ policy:
       kwargs:
         factor: 1.0
         total_iters: 10000000000
-    - milestones: [20]
+    - milestones: [50]
   generation:
     backend: vllm
     max_new_tokens: 16384
-    temperature: 1.0
+    temperature: 0.6
     top_p: 1.0
     top_k: null
     stop_token_ids: null
@@ -191,7 +194,7 @@ teacher:
     name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-14B/snapshots/40c069824f4251a91eefaf281ebe4c544efd3e18
     chat_template_kwargs:
       enable_thinking: true
-  train_global_batch_size: 16
+  train_global_batch_size: 32
   train_micro_batch_size: 1
   generation_batch_size: 4
   logprob_batch_size: 1
@@ -209,12 +212,12 @@ teacher:
     context_parallel_size: 1
     custom_parallel_plan: null
   dynamic_batching:
-    enabled: true
+    enabled: false
     train_mb_tokens: 20480
     logprob_mb_tokens: 20480
     sequence_length_round: 64
   sequence_packing:
-    enabled: false
+    enabled: true
     train_mb_tokens: 20480
     logprob_mb_tokens: 20480
     algorithm: modified_first_fit_decreasing
@@ -240,7 +243,7 @@ teacher:
       kwargs:
         factor: 1.0
         total_iters: 10000000000
-    - milestones: [20]
+    - milestones: [50]
   generation: null
 
 data:
@@ -248,9 +251,9 @@ data:
   shuffle: true
   train:
     dataset_name: ResponseDataset
-    data_path: open-thoughts/OpenThoughts-114k
-    subset: metadata
-    split: train
+    data_path: /p/project1/envcomp/yll/openthoughts114k-math-qwen3
+    subset: null
+    split: null
     filter_column: domain
     filter_value: math
     split_validation_size: 64

@@ -120,6 +120,22 @@ def _extract_problem_from_extra_env_info(extra_env_info: Any) -> str:
     return problem
 
 
+def _extract_string_from_extra_env_info(
+    extra_env_info: Any, key: str, *, require_non_empty: bool = True
+) -> str:
+    if not isinstance(extra_env_info, dict):
+        raise ValueError(
+            "Context distillation requires extra_env_info to be a dict when "
+            f"reading '{key}'."
+        )
+    value = extra_env_info.get(key)
+    if not isinstance(value, str):
+        return ""
+    if require_non_empty and not value.strip():
+        return ""
+    return value
+
+
 def _extract_last_assistant_payload(
     message_log: LLMMessageLogType,
 ) -> tuple[str, torch.Tensor, int]:
@@ -163,6 +179,8 @@ def build_context_distillation_teacher_batch(
     pad_token_id: int,
     extra_env_infos: list[dict[str, Any] | None],
     problem_source: str = "original_user_problem",
+    trace_source: str = "dynamic",
+    static_trace_answer_column: str = "",
     trace_extractor_type: str = "think_tag",
     trace_extractor_selection: str = "first",
     missing_trace_policy: str = "empty",
@@ -172,14 +190,24 @@ def build_context_distillation_teacher_batch(
 ) -> ContextDistillationBuildResult:
     if problem_source != "original_user_problem":
         raise ValueError(f"Unsupported problem_source for V1: {problem_source}")
+    if trace_source not in {"dynamic", "static_dataset"}:
+        raise ValueError(f"Unsupported trace_source for context distillation: {trace_source}")
+    if trace_source == "static_dataset" and not static_trace_answer_column.strip():
+        raise ValueError(
+            "Context distillation trace_source='static_dataset' requires a non-empty "
+            "static_trace_answer_column."
+        )
     if trace_extractor_type != "think_tag":
         raise ValueError(f"Unsupported trace extractor type for V1: {trace_extractor_type}")
     if trace_extractor_selection != "first":
         raise ValueError(
             f"Unsupported trace extractor selection for V1: {trace_extractor_selection}"
         )
-    if missing_trace_policy != "empty":
-        raise ValueError(f"Unsupported missing_trace_policy for V1: {missing_trace_policy}")
+    if missing_trace_policy not in {"empty", "drop_sample"}:
+        raise ValueError(
+            "Unsupported missing_trace_policy for context distillation: "
+            f"{missing_trace_policy}"
+        )
     if overflow_policy != "truncate_prefix_only":
         raise ValueError(f"Unsupported overflow_policy for V1: {overflow_policy}")
     if max_teacher_sequence_length <= 0:
@@ -205,6 +233,7 @@ def build_context_distillation_teacher_batch(
     dropped_too_long_response = 0
     dropped_invalid_message = 0
     dropped_no_prefix_budget = 0
+    dropped_missing_trace = 0
     debug_dump_printed = False
 
     if debug_print_first_sample and num_samples > 0:
@@ -212,7 +241,18 @@ def build_context_distillation_teacher_batch(
         try:
             sample0_problem = _extract_problem_from_extra_env_info(extra_env_infos[0])
             sample0_response_text, _, _ = _extract_last_assistant_payload(message_logs[0])
-            sample0_trace = extract_first_think_span(sample0_response_text)
+            sample0_trace_source_text = sample0_response_text
+            sample0_trace_source_label = "STUDENT TRACE SOURCE TEXT (LIVE RESPONSE)"
+            if trace_source == "static_dataset":
+                sample0_trace_source_text = _extract_string_from_extra_env_info(
+                    extra_env_infos[0],
+                    static_trace_answer_column,
+                )
+                sample0_trace_source_label = (
+                    "STATIC TRACE SOURCE TEXT "
+                    f"(extra_env_info['{static_trace_answer_column}'])"
+                )
+            sample0_trace = extract_first_think_span(sample0_trace_source_text)
             sample0_teacher_payload = teacher_prefix_template.format(
                 problem=sample0_problem, trace=sample0_trace
             )
@@ -227,13 +267,15 @@ def build_context_distillation_teacher_batch(
                     f"sample_mask: {sample0_mask}\n\n"
                     "1) WHOLE STUDENT GENERATION\n"
                     f"{sample0_response_text}\n\n"
-                    "2) EXTRACTED TRACE\n"
+                    f"2) {sample0_trace_source_label}\n"
+                    f"{sample0_trace_source_text}\n\n"
+                    "3) EXTRACTED TRACE\n"
                     f"{sample0_trace}\n\n"
-                    "3) RAW TEACHER PROMPT PAYLOAD (PROBLEM + EXTRACTED TRACE)\n"
+                    "4) RAW TEACHER PROMPT PAYLOAD (PROBLEM + EXTRACTED TRACE)\n"
                     f"{sample0_teacher_payload}\n\n"
-                    "4) CHAT-FORMATTED TEACHER PREFIX (ACTUAL CONTEXT TOKENIZED)\n"
+                    "5) CHAT-FORMATTED TEACHER PREFIX (ACTUAL CONTEXT TOKENIZED)\n"
                     f"{sample0_teacher_chat_prefix}\n\n"
-                    "5) TEXT THE TEACHER SCORES\n"
+                    "6) TEXT THE TEACHER SCORES\n"
                     f"{sample0_response_text}\n"
                     "===== END CONTEXT DISTILLATION FIRST-SAMPLE DUMP =====\n"
                 ),
@@ -266,7 +308,18 @@ def build_context_distillation_teacher_batch(
             dropped_invalid_message += 1
             continue
 
-        trace = extract_first_think_span(response_text)
+        trace_source_text = response_text
+        if trace_source == "static_dataset":
+            trace_source_text = _extract_string_from_extra_env_info(
+                extra_env_infos[sample_idx],
+                static_trace_answer_column,
+            )
+        trace = extract_first_think_span(trace_source_text)
+        if not trace and missing_trace_policy == "drop_sample":
+            sample_mask_out[sample_idx] = 0.0
+            dropped_samples += 1
+            dropped_missing_trace += 1
+            continue
         if trace:
             trace_hits += 1
             trace_char_total += len(trace)
@@ -374,6 +427,7 @@ def build_context_distillation_teacher_batch(
             "context_distillation_dropped_no_prefix_budget": float(
                 dropped_no_prefix_budget
             ),
+            "context_distillation_dropped_missing_trace": float(dropped_missing_trace),
             "context_distillation_valid_samples": float(valid_samples),
         }
 

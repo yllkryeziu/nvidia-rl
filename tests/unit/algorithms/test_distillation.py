@@ -1028,6 +1028,86 @@ def test_context_distillation_requires_single_turn_rollouts():
         setup(master_config, tokenizer, dataset, None)
 
 
+def test_context_distillation_rejects_invalid_trace_source():
+    from nemo_rl.algorithms.distillation import setup
+
+    master_config = {
+        "policy": {
+            "model_name": "same-model",
+            "generation": {"backend": "vllm", "colocated": {"enabled": True}},
+            "dtensor_cfg": {"enabled": False},
+        },
+        "teacher": {
+            "model_name": "same-model",
+            "dtensor_cfg": {"enabled": False},
+        },
+        "loss_fn": {},
+        "distillation": {
+            "seed": 42,
+            "max_rollout_turns": 1,
+            "context_distillation": {
+                "enabled": True,
+                "mode": "self_frozen",
+                "problem_source": "original_user_problem",
+                "alignment": "response_token_index",
+                "frozen_teacher_source": "base_model",
+                "trace_source": "not_a_real_mode",
+            },
+        },
+        "data": {"shuffle": False},
+        "logger": {},
+        "checkpointing": {},
+        "cluster": {"num_nodes": 1, "gpus_per_node": 1},
+    }
+
+    tokenizer = MagicMock()
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=10)
+
+    with pytest.raises(ValueError, match="trace_source"):
+        setup(master_config, tokenizer, dataset, None)
+
+
+def test_context_distillation_static_trace_source_requires_answer_column():
+    from nemo_rl.algorithms.distillation import setup
+
+    master_config = {
+        "policy": {
+            "model_name": "same-model",
+            "generation": {"backend": "vllm", "colocated": {"enabled": True}},
+            "dtensor_cfg": {"enabled": False},
+        },
+        "teacher": {
+            "model_name": "same-model",
+            "dtensor_cfg": {"enabled": False},
+        },
+        "loss_fn": {},
+        "distillation": {
+            "seed": 42,
+            "max_rollout_turns": 1,
+            "context_distillation": {
+                "enabled": True,
+                "mode": "self_frozen",
+                "problem_source": "original_user_problem",
+                "alignment": "response_token_index",
+                "frozen_teacher_source": "base_model",
+                "trace_source": "static_dataset",
+            },
+        },
+        "data": {"shuffle": False},
+        "logger": {},
+        "checkpointing": {},
+        "cluster": {"num_nodes": 1, "gpus_per_node": 1},
+    }
+
+    tokenizer = MagicMock()
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=10)
+
+    with pytest.raises(ValueError, match="static_trace.answer_column"):
+        setup(master_config, tokenizer, dataset, None)
+
+
 def test_distillation_train_teacher_resident_mode_calls_prepare_once(mock_components):
     mock_components["master_config"]["distillation"]["max_num_steps"] = 3
     mock_components["master_config"]["distillation"]["resource_isolation"] = {

@@ -108,10 +108,10 @@ class ResponseDataset(RawDataset):
         self.split_train_validation(split_validation_size, seed)
 
     def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "messages": [
-                {"role": "user", "content": data[self.input_key]},
-                {"role": "assistant", "content": data[self.output_key]},
-            ],
-            "task_name": self.task_name,
-        }
+        formatted = dict(data)
+        formatted["messages"] = [
+            {"role": "user", "content": data[self.input_key]},
+            {"role": "assistant", "content": data[self.output_key]},
+        ]
+        formatted["task_name"] = self.task_name
+        return formatted

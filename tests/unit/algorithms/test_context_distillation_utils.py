@@ -25,10 +25,26 @@ class DummyTokenizer:
     pad_token_id = 0
     bos_token_id = 1
 
+    def __init__(self):
+        self.last_chat_payload = None
+
     def __call__(self, text, add_special_tokens=False, return_tensors="pt"):
         tokens = [tok for tok in text.split(" ") if tok]
         token_ids = torch.arange(1, len(tokens) + 1, dtype=torch.long).unsqueeze(0)
         return {"input_ids": token_ids}
+
+    def apply_chat_template(
+        self,
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        add_special_tokens=False,
+    ):
+        assert tokenize is False
+        assert add_generation_prompt is True
+        assert add_special_tokens is False
+        self.last_chat_payload = messages[0]["content"]
+        return f"USER {messages[0]['content']} ASSISTANT"
 
 
 def _message(role: str, content: str, token_ids: list[int]) -> dict[str, object]:
@@ -64,6 +80,7 @@ def test_build_teacher_batch_and_align_topk():
         teacher_prefix_template="P {problem} T {trace}",
         max_teacher_sequence_length=32,
         pad_token_id=tokenizer.pad_token_id,
+        extra_env_infos=[{"problem": "solve x"}],
     )
 
     assert result.teacher_data is not None
@@ -129,9 +146,107 @@ def test_build_teacher_batch_truncation_and_drop_too_long_response():
         teacher_prefix_template="tok0 tok1 tok2 tok3 tok4 {problem} {trace}",
         max_teacher_sequence_length=5,
         pad_token_id=tokenizer.pad_token_id,
+        extra_env_infos=[{"problem": "u v"}, {"problem": "q"}],
     )
 
     assert result.valid_sample_indices == [0]
     assert result.sample_mask.tolist() == [1.0, 0.0]
     assert result.metrics["context_distillation_prefix_truncation_count"] == 1.0
     assert result.metrics["context_distillation_dropped_too_long_response"] == 1.0
+
+
+def test_build_teacher_batch_static_trace_source_uses_dataset_answer():
+    tokenizer = DummyTokenizer()
+    message_logs = [
+        [
+            _message("user", "solve x", [10, 11]),
+            _message(
+                "assistant",
+                "<think>live trace</think> final",
+                [20, 21, 22],
+            ),
+        ]
+    ]
+
+    result = build_context_distillation_teacher_batch(
+        message_logs=message_logs,  # type: ignore[arg-type]
+        sample_mask=torch.tensor([1.0], dtype=torch.float32),
+        student_input_lengths=torch.tensor([5], dtype=torch.long),
+        tokenizer=tokenizer,
+        teacher_prefix_template="P {problem} T {trace}",
+        max_teacher_sequence_length=64,
+        pad_token_id=tokenizer.pad_token_id,
+        extra_env_infos=[
+            {
+                "problem": "solve x",
+                "qwen3_1b7_original_answer": "<think>dataset trace words</think> ans",
+            }
+        ],
+        trace_source="static_dataset",
+        static_trace_answer_column="qwen3_1b7_original_answer",
+    )
+
+    assert result.teacher_data is not None
+    assert tokenizer.last_chat_payload is not None
+    assert "dataset trace words" in tokenizer.last_chat_payload
+    assert "live trace" not in tokenizer.last_chat_payload
+
+
+def test_build_teacher_batch_static_trace_missing_drops_sample():
+    tokenizer = DummyTokenizer()
+    message_logs = [
+        [
+            _message("user", "solve x", [10, 11]),
+            _message("assistant", "<think>live trace</think> final", [20, 21, 22]),
+        ]
+    ]
+
+    result = build_context_distillation_teacher_batch(
+        message_logs=message_logs,  # type: ignore[arg-type]
+        sample_mask=torch.tensor([1.0], dtype=torch.float32),
+        student_input_lengths=torch.tensor([5], dtype=torch.long),
+        tokenizer=tokenizer,
+        teacher_prefix_template="P {problem} T {trace}",
+        max_teacher_sequence_length=64,
+        pad_token_id=tokenizer.pad_token_id,
+        extra_env_infos=[{"problem": "solve x"}],
+        trace_source="static_dataset",
+        static_trace_answer_column="qwen3_1b7_original_answer",
+        missing_trace_policy="drop_sample",
+    )
+
+    assert result.teacher_data is None
+    assert result.valid_sample_indices == []
+    assert result.sample_mask.tolist() == [0.0]
+    assert result.metrics["context_distillation_dropped_missing_trace"] == 1.0
+
+
+def test_build_teacher_batch_static_trace_no_think_drops_sample():
+    tokenizer = DummyTokenizer()
+    message_logs = [
+        [
+            _message("user", "solve x", [10, 11]),
+            _message("assistant", "<think>live trace</think> final", [20, 21, 22]),
+        ]
+    ]
+
+    result = build_context_distillation_teacher_batch(
+        message_logs=message_logs,  # type: ignore[arg-type]
+        sample_mask=torch.tensor([1.0], dtype=torch.float32),
+        student_input_lengths=torch.tensor([5], dtype=torch.long),
+        tokenizer=tokenizer,
+        teacher_prefix_template="P {problem} T {trace}",
+        max_teacher_sequence_length=64,
+        pad_token_id=tokenizer.pad_token_id,
+        extra_env_infos=[
+            {"problem": "solve x", "qwen3_1b7_original_answer": "no think tags here"}
+        ],
+        trace_source="static_dataset",
+        static_trace_answer_column="qwen3_1b7_original_answer",
+        missing_trace_policy="drop_sample",
+    )
+
+    assert result.teacher_data is None
+    assert result.valid_sample_indices == []
+    assert result.sample_mask.tolist() == [0.0]
+    assert result.metrics["context_distillation_dropped_missing_trace"] == 1.0

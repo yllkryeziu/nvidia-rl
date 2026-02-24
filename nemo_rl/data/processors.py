@@ -394,6 +394,11 @@ def math_hf_data_processor(
     raw_problem = user_message[0]["content"]
     problem = raw_problem
     extra_env_info = {"ground_truth": user_message[1]["content"], "problem": raw_problem}
+    for key, value in datum_dict.items():
+        if key in {"messages", "task_name"} or key in extra_env_info:
+            continue
+        if isinstance(value, str):
+            extra_env_info[key] = value
 
     message_log: LLMMessageLogType = []
     formatted_content = (

@@ -1,21 +1,24 @@
 distillation:
-  num_prompts_per_step: 4
+  num_prompts_per_step: 32
   num_generations_per_prompt: 1
   max_rollout_turns: 1
   max_num_steps: 1000
   max_num_epochs: 1
-  val_batch_size: 1
+  val_batch_size: 16
   val_period: 50
   val_at_start: false
   val_at_end: true
-  max_val_samples: 50
+  max_val_samples: 64
   val_track_train_metrics: true
-  topk_logits_k: 64
+  topk_logits_k: 2048
   seed: 42
   context_distillation:
     enabled: true
     mode: self_frozen
     problem_source: original_user_problem
+    trace_source: static_dataset
+    static_trace:
+      answer_column: qwen3_1b7_original_answer
     teacher_prefix_template: |
       ### TASK
       You will receive an input containing two parts: a **problem statement** and a **reasoning trace** (an authentic, detailed internal monologue of someone working through the problem).
@@ -49,7 +52,7 @@ distillation:
       Preserve and reuse original reasoning steps wherever possible. When you must add text, imitate the original's style closely. Explore several different paths of reasoning like the original if the problem difficulty demands that.
 
       ### OUTPUT RULES:
-      - Your output has to have a clear, step-by-step summary that walks through the key steps taken to arrive at the answer. This summary should:
+      - After thinking, end with the closing thinking tag, then your output has to have a clear, step-by-step summary that walks through the key steps taken to arrive at the answer. This summary should:
           - Don't write step-by-step summary anywhere
           - Present the logical progression in clean, readable steps (not the raw internal monologue)
           - Conclude with the final answer in the same format as the original (e.g., \boxed{{}})
@@ -68,7 +71,7 @@ distillation:
     trace_extractor:
       type: think_tag
       selection: first
-      missing_trace_policy: empty
+      missing_trace_policy: drop_sample
     metrics:
       enabled: true
   resource_isolation:
@@ -88,11 +91,11 @@ distillation:
 loss_fn:
   kl_type: reverse
   mixed_kl_weight: 0.5
-  zero_outside_topk: false
+  zero_outside_topk: true
 
 checkpointing:
   enabled: true
-  checkpoint_dir: checkpoints/context-self-distill-qwen3-14b-3n4g
+  checkpoint_dir: checkpoints/dev-topk-2048-zero-true
   metric_name: val:accuracy
   higher_is_better: true
   keep_top_k: 3
@@ -102,13 +105,14 @@ checkpointing:
   save_consolidated: false
 
 policy:
-  model_name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-14B/snapshots/40c069824f4251a91eefaf281ebe4c544efd3e18
+  model_name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
   tokenizer:
-    name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-14B/snapshots/40c069824f4251a91eefaf281ebe4c544efd3e18
-    chat_template_kwargs: null
-  train_global_batch_size: 4
+    name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
+    chat_template_kwargs:
+      enable_thinking: true
+  train_global_batch_size: 32
   train_micro_batch_size: 1
-  generation_batch_size: 1
+  generation_batch_size: 16
   logprob_batch_size: 1
   max_total_sequence_length: 20480
   precision: bfloat16
@@ -120,11 +124,11 @@ policy:
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: true
-    tensor_parallel_size: 4
+    tensor_parallel_size: 2
     context_parallel_size: 1
     custom_parallel_plan: null
   dynamic_batching:
-    enabled: true
+    enabled: false
     train_mb_tokens: 20480
     logprob_mb_tokens: 20480
     sequence_length_round: 64
@@ -135,11 +139,11 @@ policy:
     algorithm: modified_first_fit_decreasing
     sequence_length_round: 64
   max_grad_norm: 1.0
-  make_sequence_length_divisible_by: 8
+  make_sequence_length_divisible_by: 2
   optimizer:
     name: torch.optim.AdamW
     kwargs:
-      lr: 6.0e-6
+      lr: 5.0e-6
       weight_decay: 0.01
       betas: [0.9, 0.999]
       eps: 1.0e-8
@@ -150,16 +154,16 @@ policy:
       kwargs:
         start_factor: 0.1
         end_factor: 1.0
-        total_iters: 20
+        total_iters: 50
     - name: torch.optim.lr_scheduler.ConstantLR
       kwargs:
         factor: 1.0
         total_iters: 10000000000
-    - milestones: [20]
+    - milestones: [50]
   generation:
     backend: vllm
     max_new_tokens: 16384
-    temperature: 1.0
+    temperature: 0.6
     top_p: 1.0
     top_k: null
     stop_token_ids: null
@@ -168,10 +172,10 @@ policy:
       async_engine: false
       precision: bfloat16
       kv_cache_dtype: auto
-      tensor_parallel_size: 4
+      tensor_parallel_size: 1
       pipeline_parallel_size: 1
       expert_parallel_size: 1
-      gpu_memory_utilization: 0.62
+      gpu_memory_utilization: 0.90
       max_model_len: 20480
       enforce_eager: false
       use_deep_gemm: false
@@ -185,13 +189,14 @@ policy:
         num_nodes: 1
 
 teacher:
-  model_name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-14B/snapshots/40c069824f4251a91eefaf281ebe4c544efd3e18
+  model_name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
   tokenizer:
-    name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-14B/snapshots/40c069824f4251a91eefaf281ebe4c544efd3e18
-    chat_template_kwargs: null
-  train_global_batch_size: 4
+    name: /p/project1/envcomp/yll/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
+    chat_template_kwargs:
+      enable_thinking: true
+  train_global_batch_size: 32
   train_micro_batch_size: 1
-  generation_batch_size: 1
+  generation_batch_size: 16
   logprob_batch_size: 1
   max_total_sequence_length: 20480
   precision: bfloat16
@@ -203,11 +208,11 @@ teacher:
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: true
-    tensor_parallel_size: 4
+    tensor_parallel_size: 2
     context_parallel_size: 1
     custom_parallel_plan: null
   dynamic_batching:
-    enabled: true
+    enabled: false
     train_mb_tokens: 20480
     logprob_mb_tokens: 20480
     sequence_length_round: 64
@@ -218,11 +223,11 @@ teacher:
     algorithm: modified_first_fit_decreasing
     sequence_length_round: 64
   max_grad_norm: 1.0
-  make_sequence_length_divisible_by: 8
+  make_sequence_length_divisible_by: 2
   optimizer:
     name: torch.optim.AdamW
     kwargs:
-      lr: 6.0e-6
+      lr: 5.0e-6
       weight_decay: 0.01
       betas: [0.9, 0.999]
       eps: 1.0e-8
@@ -233,12 +238,12 @@ teacher:
       kwargs:
         start_factor: 0.1
         end_factor: 1.0
-        total_iters: 20
+        total_iters: 50
     - name: torch.optim.lr_scheduler.ConstantLR
       kwargs:
         factor: 1.0
         total_iters: 10000000000
-    - milestones: [20]
+    - milestones: [50]
   generation: null
 
 data:
@@ -246,12 +251,12 @@ data:
   shuffle: true
   train:
     dataset_name: ResponseDataset
-    data_path: open-thoughts/OpenThoughts-114k
-    subset: metadata
-    split: train
+    data_path: /p/project1/envcomp/yll/openthoughts114k-math-qwen3
+    subset: null
+    split: null
     filter_column: domain
     filter_value: math
-    split_validation_size: 50
+    split_validation_size: 64
     seed: 42
     input_key: problem
     output_key: ground_truth_solution
@@ -266,7 +271,7 @@ env:
     num_workers: 8
 
 logger:
-  log_dir: logs/context-self-distill-qwen3-14b-3n4g
+  log_dir: logs/dev-topk-2048-zero-true
   num_val_samples_to_print: 5
   wandb_enabled: true
   tensorboard_enabled: true
@@ -275,9 +280,9 @@ logger:
   monitor_gpus: true
   wandb:
     project: nemo-distillation
-    name: context-self-distill-qwen3-14b-3n4g
+    name: dev-topk-2048-zero-true
   tensorboard:
-    log_dir: tb_logs-context-self-distill-qwen3-14b-3n4g
+    log_dir: tb_logs-dev-topk-2048-zero-true
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10

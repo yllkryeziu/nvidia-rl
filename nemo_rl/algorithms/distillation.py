@@ -81,6 +81,10 @@ class ContextDistillationTraceExtractorConfig(TypedDict):
     missing_trace_policy: str
 
 
+class ContextDistillationStaticTraceConfig(TypedDict):
+    answer_column: str
+
+
 class ContextDistillationMetricsConfig(TypedDict):
     enabled: bool
 
@@ -89,6 +93,8 @@ class ContextDistillationConfig(TypedDict):
     enabled: bool
     mode: str
     problem_source: str
+    trace_source: NotRequired[str]
+    static_trace: NotRequired[ContextDistillationStaticTraceConfig]
     teacher_prefix_template: str
     trace_extractor: ContextDistillationTraceExtractorConfig
     alignment: str
@@ -100,6 +106,8 @@ class ContextDistillationConfig(TypedDict):
 class ContextDistillationRuntimeConfig(TypedDict):
     enabled: bool
     problem_source: str
+    trace_source: str
+    static_trace_answer_column: str
     teacher_prefix_template: str
     trace_type: str
     trace_selection: str
@@ -156,6 +164,42 @@ class DistillationSaveState(TypedDict):
     ]  # Can be any metric. Setted to 'accuracy' by default in validation.
     consumed_samples: int
     total_valid_tokens: int  # Track total number of non-padding tokens during training
+
+
+def _get_context_trace_source_and_static_column(
+    context_distillation_cfg: dict[str, Any],
+) -> tuple[str, str]:
+    trace_source = str(context_distillation_cfg.get("trace_source", "dynamic"))
+    if trace_source not in {"dynamic", "static_dataset"}:
+        raise ValueError(
+            "distillation.context_distillation.trace_source must be one of "
+            "{'dynamic', 'static_dataset'}. "
+            f"Got {trace_source!r}."
+        )
+
+    static_trace_cfg = context_distillation_cfg.get("static_trace", {})
+    if static_trace_cfg is None:
+        static_trace_cfg = {}
+    if not isinstance(static_trace_cfg, dict):
+        raise ValueError(
+            "distillation.context_distillation.static_trace must be a mapping "
+            "when provided."
+        )
+    answer_column = static_trace_cfg.get("answer_column", "")
+    if answer_column is None:
+        answer_column = ""
+    if not isinstance(answer_column, str):
+        raise ValueError(
+            "distillation.context_distillation.static_trace.answer_column must be a string."
+        )
+
+    if trace_source == "static_dataset" and not answer_column.strip():
+        raise ValueError(
+            "distillation.context_distillation.static_trace.answer_column must be set "
+            "when trace_source='static_dataset'."
+        )
+
+    return trace_source, answer_column
 
 
 def _default_distillation_save_state() -> DistillationSaveState:
@@ -322,6 +366,10 @@ def _populate_teacher_topk_for_train_data(
             ],
             pad_token_id=tokenizer.pad_token_id,
             problem_source=context_runtime_cfg["problem_source"],
+            trace_source=context_runtime_cfg["trace_source"],
+            static_trace_answer_column=context_runtime_cfg[
+                "static_trace_answer_column"
+            ],
             trace_extractor_type=context_runtime_cfg["trace_type"],
             trace_extractor_selection=context_runtime_cfg["trace_selection"],
             missing_trace_policy=context_runtime_cfg["missing_trace_policy"],
@@ -792,6 +840,7 @@ def setup(
             raise AssertionError(
                 "distillation.context_distillation.problem_source must be 'original_user_problem' for V1."
             )
+        _get_context_trace_source_and_static_column(context_distillation_cfg)
         assert policy_config["model_name"] == teacher_config["model_name"], (
             "For self_frozen context distillation V1, policy.model_name and teacher.model_name must be identical."
         )
@@ -1199,6 +1248,8 @@ def distillation_train(
     context_metrics_enabled = True
     context_teacher_prefix_template = ""
     context_problem_source = "original_user_problem"
+    context_trace_source = "dynamic"
+    context_static_trace_answer_column = ""
     context_trace_type = "think_tag"
     context_trace_selection = "first"
     context_missing_trace_policy = "empty"
@@ -1250,6 +1301,10 @@ def distillation_train(
         context_problem_source = context_distillation_cfg.get(
             "problem_source", context_problem_source
         )
+        (
+            context_trace_source,
+            context_static_trace_answer_column,
+        ) = _get_context_trace_source_and_static_column(context_distillation_cfg)
         context_teacher_prefix_template = context_distillation_cfg.get(
             "teacher_prefix_template",
             "You are given a problem and a trace: {problem} + {trace}. Solve it on your own.",
@@ -1269,6 +1324,8 @@ def distillation_train(
     context_runtime_cfg: ContextDistillationRuntimeConfig = {
         "enabled": context_distillation_enabled,
         "problem_source": context_problem_source,
+        "trace_source": context_trace_source,
+        "static_trace_answer_column": context_static_trace_answer_column,
         "teacher_prefix_template": context_teacher_prefix_template,
         "trace_type": context_trace_type,
         "trace_selection": context_trace_selection,
@@ -1731,6 +1788,14 @@ def validate(
                 if context_distillation_cfg
                 else {}
             )
+            if context_distillation_cfg:
+                (
+                    context_trace_source,
+                    context_static_trace_answer_column,
+                ) = _get_context_trace_source_and_static_column(context_distillation_cfg)
+            else:
+                context_trace_source = "dynamic"
+                context_static_trace_answer_column = ""
             context_runtime_cfg = {
                 "enabled": bool(
                     context_distillation_cfg
@@ -1743,6 +1808,8 @@ def validate(
                     if context_distillation_cfg
                     else "original_user_problem"
                 ),
+                "trace_source": context_trace_source,
+                "static_trace_answer_column": context_static_trace_answer_column,
                 "teacher_prefix_template": (
                     context_distillation_cfg.get(
                         "teacher_prefix_template",

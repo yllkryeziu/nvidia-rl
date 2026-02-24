@@ -1,4 +1,4 @@
-# Context Self-Distillation v2 Runbook (16 prompts/step, A100 40GB)
+# Context Self-Distillation v2 Runbook (32 prompts/step, A100 40GB)
 
 Run from repo root:
 
@@ -23,6 +23,9 @@ Validation setup for all `context-self-distill-qwen3-*.yaml` recipes:
 ```bash
 # 1.7B — 3 nodes (1 train + 1 gen + 1 teacher), TP=2, DP=2
 COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/context-self-distill-qwen3-1p7b-3n4g.v2.yaml'
+sbatch -N3 --export=ALL,COMMAND="$COMMAND" ray_bare.sub
+
+COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/dev.yaml'
 sbatch -N3 --export=ALL,COMMAND="$COMMAND" ray_bare.sub
 
 # 4B — 4 nodes (2 train + 1 gen + 1 teacher), TP=4, DP=2
@@ -66,12 +69,12 @@ COMMAND='uv run python examples/run_distillation.py --config examples/configs/re
 sbatch -N10 --export=ALL,COMMAND="$COMMAND" ray_bare.sub
 ```
 
-## Override: 32 prompts/step (any model)
+## Override: 16 prompts/step (any model, for debugging)
 
 Add these three overrides to any command above:
 
 ```bash
-# Example: 8B with 32 prompts/step
-COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/context-self-distill-qwen3-8b-4n4g.v2.yaml distillation.num_prompts_per_step=32 policy.train_global_batch_size=32 teacher.train_global_batch_size=32'
+# Example: 8B with 16 prompts/step
+COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/context-self-distill-qwen3-8b-4n4g.v2.yaml distillation.num_prompts_per_step=16 policy.train_global_batch_size=16 teacher.train_global_batch_size=16'
 sbatch -N4 --export=ALL,COMMAND="$COMMAND" ray_bare.sub
 ```
