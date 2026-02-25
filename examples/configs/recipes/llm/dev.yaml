@@ -4,9 +4,9 @@ distillation:
   max_rollout_turns: 1
   max_num_steps: 1000
   max_num_epochs: 1
-  val_batch_size: 16
-  val_period: 50
-  val_at_start: false
+  val_batch_size: 32
+  val_period: 20
+  val_at_start: true
   val_at_end: true
   max_val_samples: 64
   val_track_train_metrics: true
@@ -143,7 +143,7 @@ policy:
   optimizer:
     name: torch.optim.AdamW
     kwargs:
-      lr: 5.0e-6
+      lr: 1.0e-5
       weight_decay: 0.01
       betas: [0.9, 0.999]
       eps: 1.0e-8
@@ -154,12 +154,12 @@ policy:
       kwargs:
         start_factor: 0.1
         end_factor: 1.0
-        total_iters: 50
+        total_iters: 100
     - name: torch.optim.lr_scheduler.ConstantLR
       kwargs:
         factor: 1.0
         total_iters: 10000000000
-    - milestones: [50]
+    - milestones: [100]
   generation:
     backend: vllm
     max_new_tokens: 16384
@@ -227,7 +227,7 @@ teacher:
   optimizer:
     name: torch.optim.AdamW
     kwargs:
-      lr: 5.0e-6
+      lr: 1.0e-5
       weight_decay: 0.01
       betas: [0.9, 0.999]
       eps: 1.0e-8
@@ -238,12 +238,12 @@ teacher:
       kwargs:
         start_factor: 0.1
         end_factor: 1.0
-        total_iters: 50
+        total_iters: 100
     - name: torch.optim.lr_scheduler.ConstantLR
       kwargs:
         factor: 1.0
         total_iters: 10000000000
-    - milestones: [50]
+    - milestones: [100]
   generation: null
 
 data:

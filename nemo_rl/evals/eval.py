@@ -274,7 +274,7 @@ def eval_cons_k(
     return cons_k_score
 
 
-def run_env_eval(vllm_generation, dataloader, env, master_config):
+def run_env_eval(vllm_generation, dataloader, env, master_config, tokenizer=None):
     """Main entry point for running evaluation using environment.
 
     Generates model responses and evaluates them by env.
@@ -284,24 +284,27 @@ def run_env_eval(vllm_generation, dataloader, env, master_config):
         dataloader: Data loader with evaluation samples.
         env: Environment that scores responses.
         master_config: Configuration settings.
+        tokenizer: Optional tokenizer for counting completion tokens.
     """
     # Check if async engine is enabled and run appropriate version
     if master_config["generation"]["vllm_cfg"]["async_engine"]:
         asyncio.run(
             _run_env_eval_impl(
-                vllm_generation, dataloader, env, master_config, use_async=True
+                vllm_generation, dataloader, env, master_config, use_async=True,
+                tokenizer=tokenizer,
             )
         )
     else:
         asyncio.run(
             _run_env_eval_impl(
-                vllm_generation, dataloader, env, master_config, use_async=False
+                vllm_generation, dataloader, env, master_config, use_async=False,
+                tokenizer=tokenizer,
             )
         )
 
 
 async def _run_env_eval_impl(
-    vllm_generation, dataloader, env, master_config, use_async=False
+    vllm_generation, dataloader, env, master_config, use_async=False, tokenizer=None
 ):
     """Unified implementation for both sync and async evaluation."""
     # Extract for easier access
@@ -314,8 +317,10 @@ async def _run_env_eval_impl(
     # List to collect evaluation data for parquet file
     evaluation_data = []
 
-    # Run evaluation loop
-    score = 0.0
+    # Pass 1: generate outputs, run env scoring, collect all data.
+    # env_returns are buffered so we can save before scoring can crash.
+    env_returns = []
+    total_completion_tokens = 0
     for batch in dataloader:
         # measure multiple samples
         if num_tests_per_prompt > 1:
@@ -331,6 +336,16 @@ async def _run_env_eval_impl(
         # generate by vllm
         inputs = BatchedDataDict({"prompts": prompts})
         outputs = await _generate_texts(vllm_generation, inputs, use_async)
+
+        # count completion tokens per output
+        if tokenizer is not None:
+            completion_token_counts = [
+                len(tokenizer.encode(out, add_special_tokens=False))
+                for out in outputs
+            ]
+            total_completion_tokens += sum(completion_token_counts)
+        else:
+            completion_token_counts = [None] * len(outputs)
 
         # append to message_log
         for idx, output in enumerate(outputs):
@@ -349,29 +364,45 @@ async def _run_env_eval_impl(
 
         env_return = ray.get(env.step.remote(to_env, batch["extra_env_info"], True))
         rewards = env_return.rewards
+        env_returns.append(env_return)
 
         # Collect data for JSON file
-        for i, (prompt, output, message_log, reward, extra_info) in enumerate(
+        for i, (prompt, output, message_log, reward, extra_info, n_tokens) in enumerate(
             zip(
                 prompts,
                 outputs,
                 batch["message_log"],
                 rewards.tolist(),
                 batch["extra_env_info"],
+                completion_token_counts,
             )
         ):
-            evaluation_data.append(
-                {
-                    "prompt": prompt,
-                    "response": output,
-                    "reward": reward,
-                    "message_log": message_log,
-                    "extra_env_info": extra_info,
-                    "sample_index": len(evaluation_data),
-                }
-            )
+            entry = {
+                "prompt": prompt,
+                "response": output,
+                "reward": reward,
+                "message_log": message_log,
+                "extra_env_info": extra_info,
+                "sample_index": len(evaluation_data),
+            }
+            if n_tokens is not None:
+                entry["completion_tokens"] = n_tokens
+            evaluation_data.append(entry)
 
-        # update stats
+    # Cleanup before printing results
+    ray.get(env.shutdown.remote())
+    vllm_generation.shutdown()
+
+    # Save evaluation data before scoring so responses are preserved even if
+    # scoring raises (e.g. the cons@k assertion on malformed model outputs).
+    save_path = eval_config.get("save_path")
+    if evaluation_data and save_path is not None:
+        _save_evaluation_data_to_json(evaluation_data, master_config, save_path)
+
+    # Pass 2: compute scores from buffered env_returns.
+    score = 0.0
+    for env_return in env_returns:
+        rewards = env_return.rewards
         if metric == "pass@k":
             score += eval_pass_k(rewards, num_tests_per_prompt, k_value)
         elif metric == "cons@k":
@@ -382,24 +413,21 @@ async def _run_env_eval_impl(
         else:
             raise ValueError(f"Invalid metric: {metric}")
 
-    # Cleanup before printing results
-    ray.get(env.shutdown.remote())
-    vllm_generation.shutdown()
-
-    # Save evaluation data to JSON file if save_path is specified
-    save_path = eval_config.get("save_path")
-    if evaluation_data and save_path is not None:
-        _save_evaluation_data_to_json(evaluation_data, master_config, save_path)
-
     # Print results
+    n_samples = len(dataloader.dataset)
+    mean_completion_tokens = (
+        total_completion_tokens / n_samples if tokenizer is not None else None
+    )
     _print_results(
         master_config,
         generation_config,
         score,
-        len(dataloader.dataset),
+        n_samples,
         metric,
         k_value,
         num_tests_per_prompt,
+        total_completion_tokens=total_completion_tokens if tokenizer is not None else None,
+        mean_completion_tokens=mean_completion_tokens,
     )
 
 
@@ -486,6 +514,8 @@ def _print_results(
     metric,
     k_value,
     num_tests_per_prompt,
+    total_completion_tokens=None,
+    mean_completion_tokens=None,
 ):
     """Print evaluation results."""
     dataset_name = os.path.basename(master_config["data"]["dataset_name"])
@@ -502,4 +532,6 @@ def _print_results(
     print(f"{max_new_tokens=} {temperature=} {top_p=} {top_k=} {seed=}\n")
     print(f"metric={metric[:-1]}{k_value} {num_tests_per_prompt=}\n")
     print(f"score={average_score:.4f} ({score}/{dataset_size})")
+    if total_completion_tokens is not None:
+        print(f"completion_tokens: total={total_completion_tokens}  mean={mean_completion_tokens:.1f}")
     print("=" * 60 + "\n")

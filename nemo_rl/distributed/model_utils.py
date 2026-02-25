@@ -220,7 +220,11 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
         seq_size = int(vocab_parallel_logits.shape[1])
         num_chunks = (seq_size + chunk_size - 1) // chunk_size
 
-        all_grad_input = []
+        grad_input_total = torch.empty(
+            (vocab_parallel_logits.shape[0], seq_size, partition_vocab_size),
+            device=vocab_parallel_logits.device,
+            dtype=torch.float32,
+        )
 
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * chunk_size
@@ -247,10 +251,9 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
 
             grad_input.mul_(grad_output[:, chunk_start:chunk_end].unsqueeze(dim=-1))
 
-            all_grad_input.append(grad_input)
+            grad_input_total[:, chunk_start:chunk_end, :] = grad_input
 
-        grad_input = torch.cat(all_grad_input, dim=1)
-
+        grad_input = grad_input_total
         # if you add an argument to the forward method, then you must add a corresponding None here
         return grad_input, None, None, None, None, None, None
 
@@ -326,7 +329,11 @@ class ChunkedDistributedGatherLogprob(torch.autograd.Function):
 
         B, S, V_local = vocab_parallel_logits.shape
         num_chunks = (int(S) + chunk_size - 1) // chunk_size
-        all_grad_input: list[torch.Tensor] = []
+        grad_input_total = torch.empty(
+            (B, S, V_local),
+            device=vocab_parallel_logits.device,
+            dtype=torch.float32,
+        )
 
         for chunk_idx in range(num_chunks):
             s0 = chunk_idx * chunk_size
@@ -370,13 +377,7 @@ class ChunkedDistributedGatherLogprob(torch.autograd.Function):
             flat_go = go_masked.reshape(-1)
             flat_grad.scatter_add_(0, flat_chosen, flat_go)
 
-            all_grad_input.append(grad_input)
-
-        grad_input_total = (
-            torch.cat(all_grad_input, dim=1)
-            if len(all_grad_input) > 1
-            else all_grad_input[0]
-        )
+            grad_input_total[:, s0:s1, :] = grad_input
 
         return grad_input_total, None, None, None, None, None, None
 

@@ -1,0 +1,53 @@
+# Evaluation config for Qwen3-1.7B on AIME 2025
+# Override model_name and eval.save_path via CLI:
+#   uv run python examples/run_eval.py --config examples/configs/evals/qwen3_1b7_aime2025.yaml \
+#     generation.model_name=/path/to/model \
+#     eval.save_path=eval_results/13313301/step_100/aime2025
+
+defaults: "eval.yaml"
+
+eval:
+  metric: "cons@k"       # majority vote over num_tests_per_prompt samples
+  num_tests_per_prompt: 16
+  seed: 42
+  k_value: 1
+  save_path: null
+
+generation:
+  model_name: "Qwen/Qwen3-1.7B"
+  max_new_tokens: ${generation.vllm_cfg.max_model_len}
+  temperature: 0.6
+  # NeMo-RL's vLLM V1 path rejects top_p < 0.99 because logprobs become incompatible.
+  top_p: 0.99
+  top_k: -1
+  num_prompts_per_step: -1
+  vllm_cfg:
+    async_engine: false
+    precision: "bfloat16"
+    # Keep TP=1 for a small model; use cluster.gpus_per_node=4 to get DP=4 eval replicas.
+    tensor_parallel_size: 1
+    pipeline_parallel_size: 1
+    expert_parallel_size: 1
+    gpu_memory_utilization: 0.9
+    max_model_len: 16384
+    enforce_eager: false
+
+tokenizer:
+  name: ${generation.model_name}
+  chat_template: "default"
+  chat_template_kwargs:
+    enable_thinking: true
+
+data:
+  dataset_name: "aime2025"
+  max_input_seq_length: 4096
+  prompt_file: null
+  system_prompt_file: null
+
+env:
+  math:
+    num_workers: 8
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1

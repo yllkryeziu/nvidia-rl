@@ -130,6 +130,7 @@ def main():
         dataloader,
         env,
         master_config,
+        tokenizer=tokenizer,
     )
 
 

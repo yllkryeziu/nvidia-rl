@@ -1363,6 +1363,7 @@ def distillation_train(
                 val_task_to_env,
                 step=total_steps,
                 master_config=master_config,
+                logger=logger,
                 student_policy=student_policy,
                 teacher_policy=teacher_policy,
                 loss_fn=loss_fn,
@@ -1531,6 +1532,7 @@ def distillation_train(
                             val_task_to_env,
                             step=total_steps + 1,
                             master_config=master_config,
+                            logger=logger,
                             student_policy=student_policy,
                             teacher_policy=teacher_policy,
                             loss_fn=loss_fn,
@@ -1746,6 +1748,7 @@ def validate(
     val_task_to_env: Optional[dict[str, EnvironmentInterface]],
     step: int,
     master_config: MasterConfig,
+    logger: Optional[Logger] = None,
     student_policy: Optional[ColocatablePolicyInterface] = None,
     teacher_policy: Optional[ColocatablePolicyInterface] = None,
     loss_fn: Optional[DistillationLossFn] = None,
@@ -2004,6 +2007,14 @@ def validate(
     print("\n  ⏱️  Validation Timing:")
     validation_time = timing_metrics.get("total_validation_time", 0)
     print(f"    • Total validation time: {validation_time:.2f}s", flush=True)
+
+    # Persist validation samples similarly to training samples for later inspection.
+    if logger is not None and all_message_logs:
+        val_log_data = {
+            "content": all_message_logs,
+            "rewards": total_rewards,
+        }
+        logger.log_batched_dict_as_jsonl(val_log_data, f"val_data_step{step}.jsonl")
 
     # Make sure to reset the timer after validation
     timer.reset()

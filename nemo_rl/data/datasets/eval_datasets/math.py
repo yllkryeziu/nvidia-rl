@@ -14,6 +14,8 @@
 
 """Math dataset and its variants."""
 
+import os
+from pathlib import Path
 from typing import Any, Literal, Optional
 
 from datasets import load_dataset
@@ -29,9 +31,21 @@ class MathDataset:
         prompt_file: Optional[str] = None,
         system_prompt_file: Optional[str] = None,
     ):
+        url = f"https://openaipublic.blob.core.windows.net/simple-evals/{variant}.csv"
+        local_candidates = [
+            # Preferred explicit override for offline clusters.
+            Path(os.environ["NEMO_RL_SIMPLE_EVALS_DIR"]) / f"{variant}.csv"
+            if "NEMO_RL_SIMPLE_EVALS_DIR" in os.environ
+            else None,
+            # Typical when running from repo root: /.../nemo-rl/.cache/simple-evals
+            Path.cwd() / "nemo-rl" / ".cache" / "simple-evals" / f"{variant}.csv",
+            # Typical when running from nemo-rl cwd: /.../nemo-rl/.cache/simple-evals
+            Path.cwd() / ".cache" / "simple-evals" / f"{variant}.csv",
+        ]
+        data_file = next((str(p) for p in local_candidates if p is not None and p.exists()), url)
         ds = load_dataset(
             "csv",
-            data_files=f"https://openaipublic.blob.core.windows.net/simple-evals/{variant}.csv",
+            data_files=data_file,
             split="train",
         )
         self.rekeyed_ds = ds.map(self._rekey, remove_columns=ds.column_names)

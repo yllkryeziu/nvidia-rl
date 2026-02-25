@@ -130,24 +130,61 @@ srun --overlap -N1 -n1 -w "$head_node" -o "$LOG_DIR/ray-head.log" \
   --block &
 SRUN_PIDS+=($!)
 
-# Read the actual IP Ray bound to from its own log rather than guessing from the
-# hostname. On multi-NIC nodes the hostname can resolve to a management interface
-# that worker nodes cannot reach on the Ray port.
-echo "[INFO] Waiting for Ray head to log its bound IP..."
+# Read the actual IP Ray bound to from its own log when available, but do not
+# depend on a specific Ray log line to appear. Under some srun/Ray combinations
+# the startup logs can be delayed or missing even though the head is up.
+probe_node="$head_node"
+if [[ ${#nodes[@]} -gt 1 ]]; then
+  probe_node="${nodes[1]}"
+fi
+echo "[INFO] Probing Ray head reachability from $probe_node"
+
+declare -a HEAD_IP_CANDIDATES=()
+add_head_ip_candidate() {
+  local ip="$1"
+  [[ -n "$ip" ]] || return 0
+  [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 0
+  local existing
+  for existing in "${HEAD_IP_CANDIDATES[@]:-}"; do
+    [[ "$existing" == "$ip" ]] && return 0
+  done
+  HEAD_IP_CANDIDATES+=("$ip")
+}
+
+# Seed candidates from all IPv4s on the head node. We will validate them from
+# another allocated node (when available) to avoid picking an unreachable NIC.
+while read -r candidate_ip; do
+  add_head_ip_candidate "$candidate_ip"
+done < <(
+  srun --overlap -N1 -n1 -w "$head_node" \
+    bash -lc "hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+(\\.[0-9]+){3}$' || true" \
+    2>/dev/null || true
+)
+
+echo "[INFO] Waiting for Ray head to become reachable..."
 head_ip=""
 for attempt in $(seq 1 30); do
   if ! kill -0 "${SRUN_PIDS[0]}" >/dev/null 2>&1; then
     echo "[ERROR] Ray head step exited unexpectedly. Check $LOG_DIR/ray-head.log"
     exit 1
   fi
-  head_ip=$(grep -m1 'Local node IP' "$LOG_DIR/ray-head.log" 2>/dev/null \
-    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
-  if [[ -n "$head_ip" ]]; then
-    echo "[INFO] Ray head bound to IP: $head_ip"
-    break
-  fi
+
+  # Ray typically prints "Local node IP" on stdout, but logs may be delayed.
+  add_head_ip_candidate "$(grep -m1 'Local node IP' "$LOG_DIR/ray-head.log" 2>/dev/null \
+    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+
+  for candidate_ip in "${HEAD_IP_CANDIDATES[@]:-}"; do
+    if srun --overlap -N1 -n1 -w "$probe_node" \
+      "$RAY_BIN" status --address "${candidate_ip}:$RAY_PORT" >/dev/null 2>&1; then
+      head_ip="$candidate_ip"
+      echo "[INFO] Ray head reachable at: $head_ip:$RAY_PORT"
+      break 2
+    fi
+  done
+
   if [[ "$attempt" -eq 30 ]]; then
-    echo "[ERROR] Timed out waiting for Ray head to log its IP. Check $LOG_DIR/ray-head.log"
+    echo "[ERROR] Timed out waiting for Ray head. Checked candidates: ${HEAD_IP_CANDIDATES[*]:-(none)}"
+    echo "[ERROR] Check $LOG_DIR/ray-head.log"
     exit 1
   fi
   sleep 2
@@ -235,8 +272,9 @@ fi
 
 echo "[INFO] Running driver command on $head_node"
 echo "[INFO] COMMAND: $DRIVER_COMMAND"
+echo "[INFO] Driver stdout log: $LOG_DIR/ray-driver.log"
 set +e
-srun --overlap -N1 -n1 -w "$head_node" -o "$LOG_DIR/ray-driver.log" \
+srun --overlap -N1 -n1 -w "$head_node" -o "$LOG_DIR/ray-driver.log" -e "$LOG_DIR/ray-driver.log" \
   bash -lc "cd '$NEMO_DIR' && $DRIVER_COMMAND"
 DRIVER_RC=$?
 set -e

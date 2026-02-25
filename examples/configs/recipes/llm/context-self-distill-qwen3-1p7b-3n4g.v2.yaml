@@ -143,7 +143,7 @@ policy:
   optimizer:
     name: torch.optim.AdamW
     kwargs:
-      lr: 5.0e-6
+      lr: 1.0e-5
       weight_decay: 0.01
       betas: [0.9, 0.999]
       eps: 1.0e-8
@@ -227,7 +227,7 @@ teacher:
   optimizer:
     name: torch.optim.AdamW
     kwargs:
-      lr: 5.0e-6
+      lr: 1.0e-5
       weight_decay: 0.01
       betas: [0.9, 0.999]
       eps: 1.0e-8

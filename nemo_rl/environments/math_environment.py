@@ -125,8 +125,13 @@ class HFVerifyWorker:
                             extracted_answers.append(pred)
                             break
                     else:
-                        # If no match is found, means all answers are incorrect, just use the first prediction
-                        extracted_answers.append(extracted_prediction[0][0])
+                        # If no match is found, use the first prediction if available, else None.
+                        # extracted_prediction[0] may be empty if the model output had no
+                        # parseable math expression (e.g. truncated output). Guarding here
+                        # prevents an IndexError that would cause results to be double-appended
+                        # via the outer except block, corrupting the rewards/answers alignment.
+                        first = extracted_prediction[0] if extracted_prediction else []
+                        extracted_answers.append(first[0] if first else None)
 
             # It's possible to emit a TimeoutException and that wouldn't be caught since
             # it actually subclasses from BaseException and math-verify itself does not
