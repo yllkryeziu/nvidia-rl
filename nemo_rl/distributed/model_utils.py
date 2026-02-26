@@ -329,10 +329,14 @@ class ChunkedDistributedGatherLogprob(torch.autograd.Function):
 
         B, S, V_local = vocab_parallel_logits.shape
         num_chunks = (int(S) + chunk_size - 1) // chunk_size
+        # Accumulate in the input dtype (typically bf16) to avoid allocating a
+        # full [B, S, V_local] float32 buffer which can OOM on 40 GB GPUs.
+        # Per-chunk computation remains in float32 for numerical precision.
+        accum_dtype = vocab_parallel_logits.dtype
         grad_input_total = torch.empty(
             (B, S, V_local),
             device=vocab_parallel_logits.device,
-            dtype=torch.float32,
+            dtype=accum_dtype,
         )
 
         for chunk_idx in range(num_chunks):
@@ -377,7 +381,7 @@ class ChunkedDistributedGatherLogprob(torch.autograd.Function):
             flat_go = go_masked.reshape(-1)
             flat_grad.scatter_add_(0, flat_chosen, flat_go)
 
-            grad_input_total[:, s0:s1, :] = grad_input
+            grad_input_total[:, s0:s1, :] = grad_input.to(dtype=accum_dtype)
 
         return grad_input_total, None, None, None, None, None, None
 
@@ -1034,7 +1038,9 @@ class ChunkedDistributedEntropy(torch.autograd.Function):
 
         B, S, V_local = vocab_parallel_logits.shape
         num_chunks = (int(S) + chunk_size - 1) // chunk_size
-        grads: list[torch.Tensor] = []
+        # Avoid holding all chunk gradients plus an extra concatenated copy at once.
+        # Preallocate the final gradient buffer in the input dtype to reduce peak memory.
+        grad_input = torch.empty_like(vocab_parallel_logits)
 
         for chunk_idx in range(num_chunks):
             s0 = chunk_idx * chunk_size
@@ -1048,10 +1054,17 @@ class ChunkedDistributedEntropy(torch.autograd.Function):
                 H_local, op=torch.distributed.ReduceOp.SUM, group=tp_group
             )
 
-            # dH/dz = softmax * (log_probs - H_all)
-            grad_chunk = softmax_output * (log_probs - H_local.unsqueeze(-1))
-            grad_chunk.mul_(grad_output[:, s0:s1].unsqueeze(-1))
-            grads.append(grad_chunk)
+            # Free logits early — no longer needed after H_local is computed.
+            # This reclaims one [B, chunk, V_local] float32 buffer (~74 MiB per
+            # chunk on 14B TP=8) which is critical on 40 GB GPUs.
+            del logits
 
-        grad_input = torch.cat(grads, dim=1) if len(grads) > 1 else grads[0]
+            # dH/dz = softmax * (log_probs - H_all) * grad_output
+            # Compute in-place to avoid allocating a separate grad_chunk tensor.
+            log_probs.sub_(H_local.unsqueeze(-1))
+            softmax_output.mul_(log_probs)
+            del log_probs
+            softmax_output.mul_(grad_output[:, s0:s1].unsqueeze(-1))
+            grad_input[:, s0:s1, :].copy_(softmax_output.to(dtype=grad_input.dtype))
+
         return grad_input, None, None, None

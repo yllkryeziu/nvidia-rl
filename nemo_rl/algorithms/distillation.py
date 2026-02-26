@@ -73,6 +73,7 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 # Configuration
 # ===============================================================================
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+ENABLE_TEACHER_TOPK_SANITY_CHECK = False
 
 
 class ContextDistillationTraceExtractorConfig(TypedDict):
@@ -418,7 +419,7 @@ def _populate_teacher_topk_for_train_data(
             train_data["teacher_topk_logits"] = aligned_logits
             train_data["teacher_topk_indices"] = aligned_indices
 
-            if debug_print_first_sample:
+            if ENABLE_TEACHER_TOPK_SANITY_CHECK and debug_print_first_sample:
                 # One-time sanity check: does teacher top-k support the student's first response token
                 # (ideally the first token piece of "<think>") at the first scored assistant position?
                 sample0_alignment = None
@@ -1284,6 +1285,35 @@ def distillation_train(
             "to a multiple of DP. "
             f"Got step_batch={expected_step_batch_size}, data_parallel={student_dp_size}."
         )
+    validation_enabled = bool(val_period > 0 or val_at_start or val_at_end)
+    track_val_train_metrics = bool(
+        master_config["distillation"].get("val_track_train_metrics", False)
+    )
+    if validation_enabled and track_val_train_metrics:
+        val_batch_size = int(master_config["distillation"]["val_batch_size"])
+        max_val_samples = int(master_config["distillation"]["max_val_samples"])
+        if val_batch_size <= 0:
+            raise ValueError(
+                "distillation.val_batch_size must be > 0 when validation is enabled."
+            )
+        if val_batch_size % max(student_dp_size, 1) != 0:
+            raise ValueError(
+                "Validation train-metric tracking requires distillation.val_batch_size "
+                "to be divisible by student data_parallel size. "
+                f"Got val_batch_size={val_batch_size}, data_parallel={student_dp_size}. "
+                "Set distillation.val_track_train_metrics=false to disable the extra "
+                "forward-only validation loss pass."
+            )
+        tail_batch = max_val_samples % val_batch_size
+        if tail_batch != 0 and tail_batch % max(student_dp_size, 1) != 0:
+            raise ValueError(
+                "Validation train-metric tracking would create a tail validation batch "
+                "that is not divisible by student data_parallel size. "
+                f"Got max_val_samples={max_val_samples}, val_batch_size={val_batch_size}, "
+                f"tail_batch={tail_batch}, data_parallel={student_dp_size}. "
+                "Adjust distillation.max_val_samples or distillation.val_batch_size, "
+                "or set distillation.val_track_train_metrics=false."
+            )
 
     if context_distillation_enabled:
         assert context_distillation_cfg is not None
@@ -1936,10 +1966,22 @@ def validate(
 
                 with timer.time("validation_policy_training"):
                     student_policy.prepare_for_training()
+                    val_eval_gbs = int(val_train_data.size)
+                    student_val_dp_size = max(_get_data_parallel_size(student_policy), 1)
+                    if val_eval_gbs % student_val_dp_size != 0:
+                        raise ValueError(
+                            "Validation train-metric batch is not divisible by student "
+                            "data_parallel size. "
+                            f"Got validation_batch={val_eval_gbs}, "
+                            f"data_parallel={student_val_dp_size}. "
+                            "Adjust distillation.val_batch_size/max_val_samples or set "
+                            "distillation.val_track_train_metrics=false."
+                        )
                     val_train_results = student_policy.train(
                         val_train_data,
                         loss_fn,
                         eval_mode=True,
+                        gbs=val_eval_gbs,
                         timer=timer,
                     )
 
