@@ -961,6 +961,7 @@ class SequencePackingLossWrapper:
         for seq_idx in range(len(seq_starts)):
             seq_start = seq_starts[seq_idx].item()
             seq_end = seq_ends[seq_idx].item()
+            seq_length = int(unpadded_seq_lengths[seq_idx].item())
 
             # get sequence and unpad all 'data' tensors. The data dict is a BatchedDataDict of unpacked tensors
             seq_data = data.slice(seq_idx, seq_idx + 1)
@@ -983,6 +984,12 @@ class SequencePackingLossWrapper:
             next_token_logits_slice = next_token_logits.narrow(
                 1, logit_start, logit_length
             )
+            if cp_size == 1 and logit_length > seq_length:
+                # Packed Megatron outputs keep per-sequence padding in-place when CP=1.
+                # Trim the trailing padding so logits align with the already-unpadded data tensors.
+                next_token_logits_slice = next_token_logits_slice.narrow(
+                    1, 0, seq_length
+                )
 
             loss, metrics = self.loss_fn(
                 next_token_logits_slice,

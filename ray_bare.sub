@@ -41,6 +41,8 @@ cd "$NEMO_DIR"
 module --force purge
 module load Stages/2026
 module load CUDA
+module load GCC
+module load git
 module unload cuDNN >/dev/null 2>&1 || true
 if ! module load NCCL >/dev/null 2>&1; then
   echo "[WARN] Could not load NCCL module; continuing without it."
@@ -62,14 +64,53 @@ fi
 export UV_PROJECT_ENVIRONMENT="$VENV"
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 
+# Pin all runtime caches inside the repo workspace.
+export REPO_CACHE_ROOT="/p/project1/envcomp/yll/.cache"
+export JOB_CACHE_ROOT="${JOB_CACHE_ROOT:-$REPO_CACHE_ROOT/jobs/$SLURM_JOB_ID}"
+
 # Default to offline Hugging Face usage on compute nodes.
 # Can be overridden at submit time, e.g. HF_HUB_OFFLINE=0 sbatch ...
-export HF_HOME="${HF_HOME:-/p/project1/envcomp/yll/.cache/huggingface}"
+export HF_HOME="${HF_HOME:-$REPO_CACHE_ROOT/huggingface}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$HF_HOME/datasets}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
+export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$JOB_CACHE_ROOT/xdg-cache}"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$JOB_CACHE_ROOT/xdg-config}"
+export NEMO_RL_VLLM_CACHE_BASE="${NEMO_RL_VLLM_CACHE_BASE:-$JOB_CACHE_ROOT/vllm}"
+export NEMO_RL_VLLM_CONFIG_BASE="${NEMO_RL_VLLM_CONFIG_BASE:-$JOB_CACHE_ROOT/vllm-config}"
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$JOB_CACHE_ROOT/torch_inductor}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$JOB_CACHE_ROOT/triton}"
+export FLASHINFER_CACHE_DIR="${FLASHINFER_CACHE_DIR:-$JOB_CACHE_ROOT/flashinfer}"
+export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$JOB_CACHE_ROOT/torch_extensions}"
+export VLLM_NO_USAGE_STATS="${VLLM_NO_USAGE_STATS:-1}"
+export VLLM_DO_NOT_TRACK="${VLLM_DO_NOT_TRACK:-1}"
+
+# Pin distributed transports to a single network interface.
+export NETWORK_IFACE="${NETWORK_IFACE:-ib0}"
+export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-$NETWORK_IFACE}"
+export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-$NETWORK_IFACE}"
+export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
+export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+
+# JUWELS Booster has A100 GPUs (sm_80). Required by Megatron backend.
+export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0}"
+
+mkdir -p \
+  "$HF_HOME" \
+  "$HF_DATASETS_CACHE" \
+  "$TRANSFORMERS_CACHE" \
+  "$XDG_CACHE_HOME" \
+  "$XDG_CONFIG_HOME" \
+  "$NEMO_RL_VLLM_CACHE_BASE" \
+  "$NEMO_RL_VLLM_CONFIG_BASE" \
+  "$TORCHINDUCTOR_CACHE_DIR" \
+  "$TRITON_CACHE_DIR" \
+  "$FLASHINFER_CACHE_DIR" \
+  "$TORCH_EXTENSIONS_DIR"
 
 nodes=($(scontrol show hostnames "$SLURM_JOB_NODELIST"))
 head_node="${nodes[0]}"
@@ -114,15 +155,50 @@ trap cleanup EXIT
 trap on_sigint INT
 trap on_sigterm TERM
 
+get_node_iface_ipv4() {
+  local node="$1"
+  srun --overlap -N1 -n1 -w "$node" \
+    bash -lc "ip -4 -o addr show dev '$NETWORK_IFACE' | awk '{split(\$4, a, \"/\"); print a[1]}' | head -n1" \
+    2>/dev/null || true
+}
+
 echo "[INFO] Head node: $head_node"
 echo "[INFO] All nodes: ${nodes[*]}"
+echo "[INFO] Network interface: $NETWORK_IFACE"
+
+head_ip="$(get_node_iface_ipv4 "$head_node")"
+if [[ -z "$head_ip" ]]; then
+  echo "[ERROR] Could not resolve IPv4 for $head_node on interface $NETWORK_IFACE"
+  exit 1
+fi
+
+declare -a worker_nodes=()
+declare -A NODE_IPS=()
+NODE_IPS["$head_node"]="$head_ip"
+for ((i = 1; i < ${#nodes[@]}; i++)); do
+  worker_nodes+=("${nodes[$i]}")
+done
+for node in "${worker_nodes[@]:-}"; do
+  worker_ip="$(get_node_iface_ipv4 "$node")"
+  if [[ -z "$worker_ip" ]]; then
+    echo "[ERROR] Could not resolve IPv4 for $node on interface $NETWORK_IFACE"
+    exit 1
+  fi
+  NODE_IPS["$node"]="$worker_ip"
+done
+
+echo "[INFO] Head node IP: $head_ip"
+for node in "${worker_nodes[@]:-}"; do
+  echo "[INFO] Worker node IP: $node -> ${NODE_IPS[$node]}"
+done
 
 echo "[INFO] Starting Ray head on $head_node"
 srun --overlap -N1 -n1 -w "$head_node" -o "$LOG_DIR/ray-head.log" \
   "$RAY_BIN" start --head \
+  --node-ip-address="$head_ip" \
   --port="$RAY_PORT" \
   --dashboard-port="$RAY_DASHBOARD_PORT" \
-  --dashboard-host=0.0.0.0 \
+  --dashboard-host="$head_ip" \
   --num-cpus="$CPUS_PER_WORKER" \
   --num-gpus="$GPUS_PER_NODE" \
   --resources="{\"worker_units\": $GPUS_PER_NODE, \"slurm_managed_ray_cluster\": 1}" \
@@ -130,84 +206,44 @@ srun --overlap -N1 -n1 -w "$head_node" -o "$LOG_DIR/ray-head.log" \
   --block &
 SRUN_PIDS+=($!)
 
-# Collect all candidate IPs from the head node, then validate reachability
-# from EVERY worker node to avoid subnet-mismatch failures (e.g. some nodes
-# on 10.11.x.x can't reach an IP on 10.13.x.x).
-echo "[INFO] Probing Ray head reachability from ALL worker nodes"
-
-declare -a HEAD_IP_CANDIDATES=()
-add_head_ip_candidate() {
-  local ip="$1"
-  [[ -n "$ip" ]] || return 0
-  [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 0
-  local existing
-  for existing in "${HEAD_IP_CANDIDATES[@]:-}"; do
-    [[ "$existing" == "$ip" ]] && return 0
-  done
-  HEAD_IP_CANDIDATES+=("$ip")
-}
-
-# Seed candidates from all IPv4s on the head node.
-while read -r candidate_ip; do
-  add_head_ip_candidate "$candidate_ip"
-done < <(
-  srun --overlap -N1 -n1 -w "$head_node" \
-    bash -lc "hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+(\\.[0-9]+){3}$' || true" \
-    2>/dev/null || true
-)
-
 # Build list of worker nodes that need to reach the head.
-declare -a worker_nodes=()
-for ((i = 1; i < ${#nodes[@]}; i++)); do
-  worker_nodes+=("${nodes[$i]}")
-done
 # If single-node job, just validate from the head itself.
 if [[ ${#worker_nodes[@]} -eq 0 ]]; then
   worker_nodes=("$head_node")
 fi
 
-echo "[INFO] Head IP candidates: ${HEAD_IP_CANDIDATES[*]:-(none)}"
 echo "[INFO] Worker nodes to validate from: ${worker_nodes[*]}"
+head_addr="${head_ip}:$RAY_PORT"
 
 echo "[INFO] Waiting for Ray head to become reachable from all nodes..."
-head_ip=""
 for attempt in $(seq 1 30); do
   if ! kill -0 "${SRUN_PIDS[0]}" >/dev/null 2>&1; then
     echo "[ERROR] Ray head step exited unexpectedly. Check $LOG_DIR/ray-head.log"
     exit 1
   fi
 
-  # Ray typically prints "Local node IP" on stdout, but logs may be delayed.
-  add_head_ip_candidate "$(grep -m1 'Local node IP' "$LOG_DIR/ray-head.log" 2>/dev/null \
-    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
-
-  for candidate_ip in "${HEAD_IP_CANDIDATES[@]:-}"; do
-    all_reachable=true
-    for wnode in "${worker_nodes[@]}"; do
-      if ! srun --overlap -N1 -n1 -w "$wnode" \
-        "$RAY_BIN" status --address "${candidate_ip}:$RAY_PORT" >/dev/null 2>&1; then
-        echo "[DEBUG] $candidate_ip:$RAY_PORT NOT reachable from $wnode"
-        all_reachable=false
-        break
-      fi
-    done
-    if $all_reachable; then
-      head_ip="$candidate_ip"
-      echo "[INFO] Ray head reachable from ALL nodes at: $head_ip:$RAY_PORT"
-      break 2
+  all_reachable=true
+  for wnode in "${worker_nodes[@]}"; do
+    if ! srun --overlap -N1 -n1 -w "$wnode" \
+      "$RAY_BIN" status --address "$head_addr" >/dev/null 2>&1; then
+      echo "[DEBUG] $head_addr NOT reachable from $wnode"
+      all_reachable=false
+      break
     fi
   done
+  if $all_reachable; then
+    echo "[INFO] Ray head reachable from ALL nodes at: $head_addr"
+    break
+  fi
 
   if [[ "$attempt" -eq 30 ]]; then
-    echo "[ERROR] Timed out: no head IP reachable from all worker nodes."
-    echo "[ERROR] Candidates tested: ${HEAD_IP_CANDIDATES[*]:-(none)}"
+    echo "[ERROR] Timed out: head address $head_addr not reachable from all worker nodes."
     echo "[ERROR] Worker nodes: ${worker_nodes[*]}"
     echo "[ERROR] Check $LOG_DIR/ray-head.log and network routing between nodes."
     exit 1
   fi
   sleep 2
 done
-head_addr="${head_ip}:$RAY_PORT"
 echo "[INFO] Head Ray address: $head_addr"
 
 # Final sanity check: verify head can reach itself at the chosen address.
@@ -227,10 +263,12 @@ done
 
 for ((i = 1; i < ${#nodes[@]}; i++)); do
   worker="${nodes[$i]}"
+  worker_ip="${NODE_IPS[$worker]}"
   echo "[INFO] Starting Ray worker on $worker"
   srun --overlap -N1 -n1 -w "$worker" -o "$LOG_DIR/ray-worker-$i.log" \
     "$RAY_BIN" start \
     --address "$head_addr" \
+    --node-ip-address="$worker_ip" \
     --num-cpus="$CPUS_PER_WORKER" \
     --num-gpus="$GPUS_PER_NODE" \
     --resources="{\"worker_units\": $GPUS_PER_NODE, \"slurm_managed_ray_cluster\": 1}" \

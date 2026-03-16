@@ -15,7 +15,7 @@ from transformers import AutoTokenizer
 
 
 DEFAULT_EXPECTED_BENCHMARKS = ("aime2025_avg16", "math500_avg16", "livecodebench")
-BENCHMARK_ORDER = {"aime2025_avg16": 0, "math500_avg16": 1, "livecodebench": 2}
+BENCHMARK_ORDER = {"aime2025": 0, "math500": 1, "livecodebench": 2}
 
 
 def parse_bool(v: str) -> bool:
@@ -102,6 +102,24 @@ class TokenizerCache:
         return [len(tok.encode(t or "", add_special_tokens=False)) for t in texts]
 
 
+def benchmark_base_name(benchmark: str) -> str:
+    if benchmark.startswith("aime2025_avg"):
+        return "aime2025"
+    if benchmark.startswith("math500_avg"):
+        return "math500"
+    return benchmark
+
+
+def benchmark_variant_suffix(benchmark: str) -> str | None:
+    if "_avg" not in benchmark:
+        return None
+    return benchmark.rsplit("_", 1)[-1]
+
+
+def primary_metric_name_from_num_tests(num_tests: int | None) -> str:
+    return f"avg@{num_tests}_pass@1" if isinstance(num_tests, int) and num_tests > 0 else "pass@1"
+
+
 def summarize_math_like(
     run_root: Path,
     model_label: str,
@@ -121,7 +139,9 @@ def summarize_math_like(
             model_path=None,
             benchmark=benchmark_name,
             variant=variant,
-            primary_metric_name="avg@16_pass@1",
+            primary_metric_name=primary_metric_name_from_num_tests(
+                int(suffix[3:]) if (suffix := benchmark_variant_suffix(variant)) and suffix[3:].isdigit() else None
+            ),
             primary_metric_value=None,
             pass_at_5=None,
             pass_at_10=None,
@@ -149,7 +169,9 @@ def summarize_math_like(
             model_path=None,
             benchmark=benchmark_name,
             variant=variant,
-            primary_metric_name="avg@16_pass@1",
+            primary_metric_name=primary_metric_name_from_num_tests(
+                int(suffix[3:]) if (suffix := benchmark_variant_suffix(variant)) and suffix[3:].isdigit() else None
+            ),
             primary_metric_value=None,
             pass_at_5=None,
             pass_at_10=None,
@@ -188,6 +210,7 @@ def summarize_math_like(
         # best effort fallback for nonstandard outputs
         problems = None
 
+    primary_metric_name = primary_metric_name_from_num_tests(num_tests if isinstance(num_tests, int) else None)
     primary = (sum(rewards) / len(rewards)) if rewards else None
     total_tokens = sum(completion_tokens) if completion_tokens else None
     avg_tokens_per_sample = (total_tokens / samples) if (total_tokens is not None and samples) else None
@@ -211,9 +234,9 @@ def summarize_math_like(
         "model_label": model_label,
         "model_path": cfg.get("model_name"),
         "status": status,
-        "primary_metric": {"name": "avg@16_pass@1", "value": primary},
+        "primary_metric": {"name": primary_metric_name, "value": primary},
         "metrics": {
-            "avg@16_pass@1": primary,
+            primary_metric_name: primary,
             "problems": problems,
             "samples": samples,
             "samples_per_problem": spp,
@@ -239,7 +262,7 @@ def summarize_math_like(
         model_path=cfg.get("model_name"),
         benchmark=benchmark_name,
         variant=variant,
-        primary_metric_name="avg@16_pass@1",
+        primary_metric_name=primary_metric_name,
         primary_metric_value=primary,
         pass_at_5=None,
         pass_at_10=None,
@@ -478,23 +501,19 @@ def expected_rows_for_model(
     expected_benchmarks: tuple[str, ...],
 ) -> list[SummaryRow]:
     rows: list[SummaryRow] = []
-    mapping = {
-        "aime2025_avg16": model_dir / "aime2025_avg16",
-        "math500_avg16": model_dir / "math500_avg16",
-        "livecodebench": model_dir / "livecodebench" / "official_lcb",
-    }
     for benchmark in expected_benchmarks:
-        path = mapping[benchmark]
         if benchmark == "livecodebench":
+            path = model_dir / "livecodebench" / "official_lcb"
             rows.append(summarize_lcb(run_root, model_label, path, write_metrics, tok_cache))
         else:
+            path = model_dir / benchmark
             variant = benchmark
             rows.append(
                 summarize_math_like(
                     run_root=run_root,
                     model_label=model_label,
                     bench_dir=path,
-                    benchmark_name=benchmark.split("_avg16")[0],
+                    benchmark_name=benchmark_base_name(benchmark),
                     variant=variant,
                     write_metrics=write_metrics,
                 )
@@ -573,7 +592,7 @@ def main() -> None:
     ap.add_argument(
         "--benchmarks",
         default=",".join(DEFAULT_EXPECTED_BENCHMARKS),
-        help="Comma-separated expected benchmarks (aime2025_avg16,math500_avg16,livecodebench)",
+        help="Comma-separated expected benchmarks (e.g. aime2025_avg4,math500_avg4,livecodebench)",
     )
     args = ap.parse_args()
 
@@ -607,7 +626,14 @@ def main() -> None:
             )
         )
 
-    rows.sort(key=lambda r: (0 if r.model_label == "base" else 1, r.model_label, BENCHMARK_ORDER.get(r.benchmark if r.benchmark != "aime2025" and r.benchmark != "math500" else f"{r.benchmark}_avg16", 99)))
+    rows.sort(
+        key=lambda r: (
+            0 if r.model_label == "base" else 1,
+            r.model_label,
+            BENCHMARK_ORDER.get(benchmark_base_name(r.benchmark), 99),
+            r.variant,
+        )
+    )
     write_outputs(run_root, rows)
 
     if args.fail_on_missing and any(r.status in {"missing", "partial", "failed"} for r in rows):

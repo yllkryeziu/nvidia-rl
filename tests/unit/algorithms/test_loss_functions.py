@@ -23,6 +23,7 @@ from nemo_rl.algorithms.loss_functions import (
     DistillationLossFn,
     DPOLossFn,
     NLLLoss,
+    SequencePackingLossWrapper,
 )
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -1805,6 +1806,122 @@ def test_distillation_loss_zero_outside_topk():
         if k >= 32:
             assert isinstance(loss, torch.Tensor)
             assert loss.item() != 0.0  # Should have some meaningful loss
+
+
+def test_sequence_packing_distillation_trims_trailing_padding_cpu():
+    """Packed-sequence distillation should ignore per-sequence trailing padding."""
+    vocab_size = 8
+    topk = 2
+    seq_lengths = [5, 3]
+    padded_seq_lengths = [8, 4]
+    max_seq_len = max(seq_lengths)
+
+    seq1_logits = torch.randn((1, seq_lengths[0], vocab_size), dtype=torch.float32)
+    seq2_logits = torch.randn((1, seq_lengths[1], vocab_size), dtype=torch.float32)
+    packed_logits = torch.zeros(
+        (1, sum(padded_seq_lengths), vocab_size), dtype=torch.float32
+    )
+    packed_logits[:, : seq_lengths[0], :] = seq1_logits
+    packed_logits[
+        :, padded_seq_lengths[0] : padded_seq_lengths[0] + seq_lengths[1], :
+    ] = seq2_logits
+
+    teacher_seq1 = torch.randn((1, seq_lengths[0], vocab_size), dtype=torch.float32)
+    teacher_seq2 = torch.randn((1, seq_lengths[1], vocab_size), dtype=torch.float32)
+    teacher_logits_1, teacher_indices_1 = torch.topk(teacher_seq1, k=topk, dim=-1)
+    teacher_logits_2, teacher_indices_2 = torch.topk(teacher_seq2, k=topk, dim=-1)
+
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor(
+                [[1, 2, 3, 4, 5], [6, 7, 1, 0, 0]], dtype=torch.long
+            ),
+            "token_mask": torch.tensor(
+                [[0, 1, 1, 1, 1], [0, 1, 1, 0, 0]], dtype=torch.float32
+            ),
+            "sample_mask": torch.tensor([1.0, 1.0], dtype=torch.float32),
+            "teacher_topk_logits": torch.cat(
+                [
+                    torch.nn.functional.pad(
+                        teacher_logits_1,
+                        (0, 0, 0, max_seq_len - seq_lengths[0]),
+                        value=0.0,
+                    ),
+                    torch.nn.functional.pad(
+                        teacher_logits_2,
+                        (0, 0, 0, max_seq_len - seq_lengths[1]),
+                        value=0.0,
+                    ),
+                ],
+                dim=0,
+            ),
+            "teacher_topk_indices": torch.cat(
+                [
+                    torch.nn.functional.pad(
+                        teacher_indices_1,
+                        (0, 0, 0, max_seq_len - seq_lengths[0]),
+                        value=0,
+                    ),
+                    torch.nn.functional.pad(
+                        teacher_indices_2,
+                        (0, 0, 0, max_seq_len - seq_lengths[1]),
+                        value=0,
+                    ),
+                ],
+                dim=0,
+            ),
+        }
+    )
+
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": True,
+        }
+    )
+    wrapper = SequencePackingLossWrapper(
+        loss_fn=loss_fn,
+        cu_seqlens_q=torch.tensor([0, seq_lengths[0], sum(seq_lengths)], dtype=torch.int32),
+        cu_seqlens_q_padded=torch.tensor(
+            [0, padded_seq_lengths[0], sum(padded_seq_lengths)], dtype=torch.int32
+        ),
+    )
+
+    def trim_seq_data(seq_idx: int, seq_len: int) -> BatchedDataDict:
+        seq_data = data.slice(seq_idx, seq_idx + 1)
+        trimmed = {}
+        for key, value in seq_data.items():
+            if isinstance(value, torch.Tensor) and value.ndim > 1:
+                trimmed[key] = value[:, :seq_len]
+            else:
+                trimmed[key] = value
+        return BatchedDataDict(trimmed)
+
+    global_valid_seqs = data["sample_mask"].sum()
+    global_valid_toks = torch.sum(data["token_mask"][:, 1:] * data["sample_mask"].unsqueeze(-1))
+
+    wrapped_loss, _ = wrapper(
+        packed_logits,
+        data,
+        global_valid_seqs=global_valid_seqs,
+        global_valid_toks=global_valid_toks,
+    )
+
+    seq1_loss, _ = loss_fn(
+        seq1_logits,
+        trim_seq_data(0, seq_lengths[0]),
+        global_valid_seqs=global_valid_seqs,
+        global_valid_toks=global_valid_toks,
+    )
+    seq2_loss, _ = loss_fn(
+        seq2_logits,
+        trim_seq_data(1, seq_lengths[1]),
+        global_valid_seqs=global_valid_seqs,
+        global_valid_toks=global_valid_toks,
+    )
+
+    torch.testing.assert_close(wrapped_loss, seq1_loss + seq2_loss)
 
 
 def test_distillation_loss_gradient_flow():

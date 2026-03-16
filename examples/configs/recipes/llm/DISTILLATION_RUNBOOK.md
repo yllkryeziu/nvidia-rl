@@ -11,6 +11,10 @@ Configs covered:
 - `examples/configs/recipes/llm/distill_topk512_qwen3_8b.yaml`
 - `examples/configs/recipes/llm/distill_topk512_qwen3_14b.yaml`
 - `examples/configs/recipes/llm/distill_topk512_qwen3_1b7_p64_g4.yaml` (64 prompts, 4 samples/prompt)
+- `examples/configs/recipes/llm/distill_topk512_qwen3_1b7_p64_g4_w10.yaml` (warmup 10, 16 nodes)
+- `examples/configs/recipes/llm/distill_topk512_qwen3_1b7_p64_g4_w10_lr5e6.yaml` (warmup 10, lr 5e-6, 16 nodes)
+- `examples/configs/recipes/llm/distill_topk512_qwen3_1b7_p64_g4_w10_gc05.yaml` (warmup 10, grad clip 0.5, 16 nodes)
+- `examples/configs/recipes/llm/distill_topk512_qwen3_1b7_p64_g4_w10_lr5e6_gc05.yaml` (warmup 10, lr 5e-6, grad clip 0.5, 16 nodes)
 
 Common settings already baked into the `topk512` configs:
 
@@ -50,6 +54,10 @@ for p in [
     "examples/configs/recipes/llm/distill_topk512_qwen3_8b.yaml",
     "examples/configs/recipes/llm/distill_topk512_qwen3_14b.yaml",
     "examples/configs/recipes/llm/distill_topk512_qwen3_1b7_p64_g4.yaml",
+    "examples/configs/recipes/llm/distill_topk512_qwen3_1b7_p64_g4_w10.yaml",
+    "examples/configs/recipes/llm/distill_topk512_qwen3_1b7_p64_g4_w10_lr5e6.yaml",
+    "examples/configs/recipes/llm/distill_topk512_qwen3_1b7_p64_g4_w10_gc05.yaml",
+    "examples/configs/recipes/llm/distill_topk512_qwen3_1b7_p64_g4_w10_lr5e6_gc05.yaml",
 ]:
     yaml.safe_load(open(p))
     print("OK", p)
@@ -65,6 +73,10 @@ PY
 | `distill_topk512_qwen3_8b.yaml` | 7 | 4 nodes, TP=8, DP=2 | 2 nodes, vLLM TP=2 (4 engines) | 1 node, TP=2, DP=2 | sequence packing on |
 | `distill_topk512_qwen3_14b.yaml` | 11 | 8 nodes, TP=8, DP=4 | 2 nodes, vLLM TP=4 (2 engines) | 1 node, TP=4, DP=1 | sequence packing on |
 | `distill_topk512_qwen3_1b7_p64_g4.yaml` | 7 | 2 nodes, TP=4, DP=2 | 4 nodes, vLLM TP=1 (16 engines) | 1 node, TP=2, DP=2 | 64 prompts x 4 samples/prompt |
+| `distill_topk512_qwen3_1b7_p64_g4_w10.yaml` | 16 | 2 nodes, TP=4, DP=2 | 13 nodes, vLLM TP=1 (52 engines) | 1 node, TP=2, DP=2 | warmup 10, val/ckpt every 25 |
+| `distill_topk512_qwen3_1b7_p64_g4_w10_lr5e6.yaml` | 16 | 2 nodes, TP=4, DP=2 | 13 nodes, vLLM TP=1 (52 engines) | 1 node, TP=2, DP=2 | warmup 10, lr 5e-6 |
+| `distill_topk512_qwen3_1b7_p64_g4_w10_gc05.yaml` | 16 | 2 nodes, TP=4, DP=2 | 13 nodes, vLLM TP=1 (52 engines) | 1 node, TP=2, DP=2 | warmup 10, grad clip 0.5 |
+| `distill_topk512_qwen3_1b7_p64_g4_w10_lr5e6_gc05.yaml` | 16 | 2 nodes, TP=4, DP=2 | 13 nodes, vLLM TP=1 (52 engines) | 1 node, TP=2, DP=2 | warmup 10, lr 5e-6, grad clip 0.5 |
 
 ## Launch Commands
 
@@ -100,6 +112,34 @@ sbatch -J distill_topk512_qwen3_14b -N11 -t 16:00:00 -p booster --export=ALL,COM
 ```bash
 COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/distill_topk512_qwen3_1b7_p64_g4.yaml'
 sbatch -J distill_topk512_qwen3_1b7_p64_g4 -N7 -t 16:00:00 -p booster --export=ALL,COMMAND="$COMMAND" ray_bare.sub
+```
+
+### `distill_topk512_qwen3_1b7_p64_g4_w10.yaml` (16 nodes)
+
+```bash
+COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/distill_topk512_qwen3_1b7_p64_g4_w10.yaml'
+sbatch -J distill_topk512_qwen3_1b7_p64_g4_w10 -N16 -t 24:00:00 -p booster --export=ALL,COMMAND="$COMMAND" ray_bare.sub
+```
+
+### `distill_topk512_qwen3_1b7_p64_g4_w10_lr5e6.yaml` (16 nodes)
+
+```bash
+COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/distill_topk512_qwen3_1b7_p64_g4_w10_lr5e6.yaml'
+sbatch -J distill_topk512_qwen3_1b7_p64_g4_w10_lr5e6 -N16 -t 24:00:00 -p booster --export=ALL,COMMAND="$COMMAND" ray_bare.sub
+```
+
+### `distill_topk512_qwen3_1b7_p64_g4_w10_gc05.yaml` (16 nodes)
+
+```bash
+COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/distill_topk512_qwen3_1b7_p64_g4_w10_gc05.yaml'
+sbatch -J distill_topk512_qwen3_1b7_p64_g4_w10_gc05 -N16 -t 24:00:00 -p booster --export=ALL,COMMAND="$COMMAND" ray_bare.sub
+```
+
+### `distill_topk512_qwen3_1b7_p64_g4_w10_lr5e6_gc05.yaml` (16 nodes)
+
+```bash
+COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/distill_topk512_qwen3_1b7_p64_g4_w10_lr5e6_gc05.yaml'
+sbatch -J distill_topk512_qwen3_1b7_p64_g4_w10_lr5e6_gc05 -N16 -t 24:00:00 -p booster --export=ALL,COMMAND="$COMMAND" ray_bare.sub
 ```
 
 ## Startup Verification (First Minutes)

@@ -17,8 +17,14 @@ Usage:
     [--math-time 08:00:00] \
     [--aime-time 08:00:00] \
     [--lcb-time 12:00:00] \
+    [--math-aime-num-tests-per-prompt 4] \
+    [--lcb-n 4] \
+    [--lcb-temperature 0.6] \
+    [--lcb-top-p 0.95] \
+    [--lcb-max-tokens 16384] \
     [--benchmarks math500,aime2025,lcb] \
     [--force-steps "50 200 250"] \
+    [--always-convert] \
     [--dry-run]
 EOF
 }
@@ -37,8 +43,14 @@ CONVERT_TIME="01:00:00"
 MATH_TIME="08:00:00"
 AIME_TIME="08:00:00"
 LCB_TIME="12:00:00"
+MATH_AIME_NUM_TESTS_PER_PROMPT="4"
+LCB_N="4"
+LCB_TEMPERATURE="0.6"
+LCB_TOP_P="0.95"
+LCB_MAX_TOKENS="16384"
 BENCHMARKS="math500,aime2025,lcb"
 FORCE_STEPS=""
+ALWAYS_CONVERT=0
 DRY_RUN=0
 
 while [[ $# -gt 0 ]]; do
@@ -53,8 +65,14 @@ while [[ $# -gt 0 ]]; do
         --math-time) MATH_TIME="$2"; shift 2 ;;
         --aime-time) AIME_TIME="$2"; shift 2 ;;
         --lcb-time) LCB_TIME="$2"; shift 2 ;;
+        --math-aime-num-tests-per-prompt) MATH_AIME_NUM_TESTS_PER_PROMPT="$2"; shift 2 ;;
+        --lcb-n) LCB_N="$2"; shift 2 ;;
+        --lcb-temperature) LCB_TEMPERATURE="$2"; shift 2 ;;
+        --lcb-top-p) LCB_TOP_P="$2"; shift 2 ;;
+        --lcb-max-tokens) LCB_MAX_TOKENS="$2"; shift 2 ;;
         --benchmarks) BENCHMARKS="$2"; shift 2 ;;
         --force-steps) FORCE_STEPS="$2"; shift 2 ;;
+        --always-convert) ALWAYS_CONVERT=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *)
@@ -158,34 +176,70 @@ parse_job_id() {
     return 1
 }
 
-CONVERT_JOB_NAME="convert_${DISC_EXPERIMENT}"
-CONVERT_LOG="$LOGS_ROOT/${CONVERT_JOB_NAME}_%j.out"
-CONVERT_EXPORT="ALL,NEMO_DIR=$NEMO_DIR,CHECKPOINT_DIR=$DISC_CHECKPOINT_DIR,BASE_MODEL=$DISC_BASE_MODEL,UV_PROJECT_ENVIRONMENT=$NEMO_DIR/.venv"
-convert_cmd=(
-    sbatch
-    -J "$CONVERT_JOB_NAME"
-    -p "$CONVERT_PARTITION"
-    --account "$ACCOUNT"
-    --nodes 1
-    --ntasks 1
-    --cpus-per-task 8
-    --time "$CONVERT_TIME"
-    --output "$CONVERT_LOG"
-    --export="$CONVERT_EXPORT"
-    "$NEMO_DIR/scripts/slurm_convert_checkpoint_run.sh"
-)
-convert_cmd_str="$(cmd_to_string "${convert_cmd[@]}")"
+read -r -a STEP_LIST <<<"$DISC_STEPS"
+MISSING_CONSOLIDATED_STEPS=()
+for step in "${STEP_LIST[@]}"; do
+    [[ -z "$step" ]] && continue
+    consolidated_cfg="$DISC_CHECKPOINT_DIR/step_${step}/consolidated/config.json"
+    if [[ ! -f "$consolidated_cfg" ]]; then
+        MISSING_CONSOLIDATED_STEPS+=("$step")
+    fi
+done
 
-if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "[DRY RUN] FORCE_EVAL_STEPS=$DISC_STEPS $convert_cmd_str"
-    CONVERT_JOB_ID="DRYRUN_CONVERT"
+NEED_CONVERT=0
+if [[ "$ALWAYS_CONVERT" -eq 1 || "${#MISSING_CONSOLIDATED_STEPS[@]}" -gt 0 ]]; then
+    NEED_CONVERT=1
+fi
+
+CONVERT_JOB_ID=""
+convert_cmd_str=""
+EVAL_DEPENDENCY_KIND="none"
+RUN_TAG_SUFFIX="from_ready_consolidated"
+TRAIN_ANCHOR_ID="preconverted"
+dependency_note="no dependency (pre-converted checkpoints)"
+dependency_args=()
+
+if [[ "$NEED_CONVERT" -eq 1 ]]; then
+    CONVERT_JOB_NAME="convert_${DISC_EXPERIMENT}"
+    CONVERT_LOG="$LOGS_ROOT/${CONVERT_JOB_NAME}_%j.out"
+    CONVERT_EXPORT="ALL,NEMO_DIR=$NEMO_DIR,CHECKPOINT_DIR=$DISC_CHECKPOINT_DIR,BASE_MODEL=$DISC_BASE_MODEL,UV_PROJECT_ENVIRONMENT=$NEMO_DIR/.venv"
+    convert_cmd=(
+        sbatch
+        -J "$CONVERT_JOB_NAME"
+        -p "$CONVERT_PARTITION"
+        --account "$ACCOUNT"
+        --nodes 1
+        --ntasks 1
+        --cpus-per-task 8
+        --time "$CONVERT_TIME"
+        --output "$CONVERT_LOG"
+        --export="$CONVERT_EXPORT"
+        "$NEMO_DIR/scripts/slurm_convert_checkpoint_run.sh"
+    )
+    convert_cmd_str="$(cmd_to_string "${convert_cmd[@]}")"
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo "[DRY RUN] FORCE_EVAL_STEPS=$DISC_STEPS $convert_cmd_str"
+        CONVERT_JOB_ID="DRYRUN_CONVERT"
+    else
+        convert_out="$(FORCE_EVAL_STEPS="$DISC_STEPS" "${convert_cmd[@]}")"
+        echo "$convert_out"
+        CONVERT_JOB_ID="$(parse_job_id "$convert_out")" || {
+            echo "[ERROR] Failed to parse conversion job id." >&2
+            exit 1
+        }
+    fi
+
+    EVAL_DEPENDENCY_KIND="afterok"
+    RUN_TAG_SUFFIX="from_convert_${CONVERT_JOB_ID}"
+    TRAIN_ANCHOR_ID="$CONVERT_JOB_ID"
+    dependency_note="afterok:$CONVERT_JOB_ID"
+    dependency_args=(--dependency "afterok:${CONVERT_JOB_ID}")
 else
-    convert_out="$(FORCE_EVAL_STEPS="$DISC_STEPS" "${convert_cmd[@]}")"
-    echo "$convert_out"
-    CONVERT_JOB_ID="$(parse_job_id "$convert_out")" || {
-        echo "[ERROR] Failed to parse conversion job id." >&2
-        exit 1
-    }
+    echo "[INFO] All selected steps already consolidated; skipping conversion job."
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo "[DRY RUN] Conversion skipped (all selected steps already consolidated)."
+    fi
 fi
 
 MATH_JOB_ID=""
@@ -219,7 +273,12 @@ for bench in "${BENCH_LIST[@]}"; do
     esac
 
     JOB_LOG="$LOGS_ROOT/${JOB_NAME}_%j.out"
-    EVAL_EXPORT="ALL,NEMO_DIR=$NEMO_DIR,TRAIN_JOB_ID=$CONVERT_JOB_ID,CHECKPOINT_DIR_OVERRIDE=$DISC_CHECKPOINT_DIR,BASE_MODEL_OVERRIDE=$DISC_BASE_MODEL,METRIC_NAME_OVERRIDE=$DISC_METRIC_NAME,HIGHER_IS_BETTER_OVERRIDE=$DISC_HIGHER_IS_BETTER,EXPERIMENT_NAME_OVERRIDE=$DISC_EXPERIMENT,AUTO_CONSOLIDATE=0,ALLOW_PARTIAL_CHECKPOINT_SET=0,RUN_AIME2025=$RUN_AIME,RUN_MATH500=$RUN_MATH,RUN_LCB=$RUN_LCB,RESULTS_ROOT=$RESULTS_ROOT,EVAL_DEPENDENCY_KIND=afterok,UV_PROJECT_ENVIRONMENT=$NEMO_DIR/.venv,RUN_TAG=${bench}__from_convert_${CONVERT_JOB_ID}"
+    EVAL_EXPORT="ALL,NEMO_DIR=$NEMO_DIR,TRAIN_JOB_ID=$TRAIN_ANCHOR_ID,CHECKPOINT_DIR_OVERRIDE=$DISC_CHECKPOINT_DIR,BASE_MODEL_OVERRIDE=$DISC_BASE_MODEL,METRIC_NAME_OVERRIDE=$DISC_METRIC_NAME,HIGHER_IS_BETTER_OVERRIDE=$DISC_HIGHER_IS_BETTER,EXPERIMENT_NAME_OVERRIDE=$DISC_EXPERIMENT,AUTO_CONSOLIDATE=0,ALLOW_PARTIAL_CHECKPOINT_SET=0,RUN_AIME2025=$RUN_AIME,RUN_MATH500=$RUN_MATH,RUN_LCB=$RUN_LCB,RESULTS_ROOT=$RESULTS_ROOT,EVAL_DEPENDENCY_KIND=$EVAL_DEPENDENCY_KIND,UV_PROJECT_ENVIRONMENT=$NEMO_DIR/.venv,RUN_TAG=${bench}__${RUN_TAG_SUFFIX},MATH_AIME_NUM_TESTS_PER_PROMPT=$MATH_AIME_NUM_TESTS_PER_PROMPT${EVAL_CONFIG_PREFIX:+,EVAL_CONFIG_PREFIX=$EVAL_CONFIG_PREFIX}"
+    if [[ "$RUN_LCB" -eq 1 ]]; then
+        # Pin the official LCB generation settings so stale submit-shell LCB_* env vars
+        # cannot silently override the intended defaults via `sbatch --export=ALL,...`.
+        EVAL_EXPORT+=",LCB_N=$LCB_N,LCB_TEMPERATURE=$LCB_TEMPERATURE,LCB_TOP_P=$LCB_TOP_P,LCB_MAX_TOKENS=$LCB_MAX_TOKENS"
+    fi
 
     eval_cmd=(
         sbatch
@@ -231,7 +290,7 @@ for bench in "${BENCH_LIST[@]}"; do
         --gres "gpu:4"
         --cpus-per-task 32
         --time "$JOB_TIME"
-        --dependency "afterok:${CONVERT_JOB_ID}"
+        "${dependency_args[@]}"
         --output "$JOB_LOG"
         --export="$EVAL_EXPORT"
         "$NEMO_DIR/scripts/slurm_posttrain_eval_suite.sh"
@@ -279,6 +338,11 @@ uv run python - \
   "$RESULTS_ROOT" \
   "$LOGS_ROOT" \
   "$DRY_RUN" \
+  "$NEED_CONVERT" \
+  "$ALWAYS_CONVERT" \
+  "$(IFS=' '; echo "${MISSING_CONSOLIDATED_STEPS[*]}")" \
+  "$EVAL_DEPENDENCY_KIND" \
+  "$TRAIN_ANCHOR_ID" \
   "$CONVERT_JOB_ID" \
   "$MATH_JOB_ID" \
   "$AIME_JOB_ID" \
@@ -307,6 +371,11 @@ from pathlib import Path
     results_root,
     logs_root,
     dry_run,
+    need_convert,
+    always_convert,
+    missing_consolidated_steps,
+    eval_dependency_kind,
+    train_anchor_id,
     convert_job_id,
     math_job_id,
     aime_job_id,
@@ -332,6 +401,13 @@ doc = {
     "results_root": results_root,
     "logs_root": logs_root,
     "dry_run": bool(int(dry_run)),
+    "conversion": {
+        "required": bool(int(need_convert)),
+        "always_convert": bool(int(always_convert)),
+        "missing_consolidated_steps": missing_consolidated_steps.split(),
+    },
+    "eval_dependency_kind": eval_dependency_kind,
+    "train_anchor_id": train_anchor_id,
     "jobs": {
         "convert": {"job_id": convert_job_id, "command": convert_cmd},
         "math500": {"job_id": math_job_id, "command": math_cmd},
@@ -347,8 +423,12 @@ PY
 echo "[INFO] Experiment: $DISC_EXPERIMENT"
 echo "[INFO] Checkpoint dir: $DISC_CHECKPOINT_DIR"
 echo "[INFO] Steps: $DISC_STEPS"
-echo "[INFO] Conversion job: $CONVERT_JOB_ID"
-[[ -n "$MATH_JOB_ID" ]] && echo "[INFO] Math500 job:   $MATH_JOB_ID (afterok:$CONVERT_JOB_ID)"
-[[ -n "$AIME_JOB_ID" ]] && echo "[INFO] AIME2025 job:  $AIME_JOB_ID (afterok:$CONVERT_JOB_ID)"
-[[ -n "$LCB_JOB_ID" ]] && echo "[INFO] LCB job:       $LCB_JOB_ID (afterok:$CONVERT_JOB_ID)"
+if [[ "$NEED_CONVERT" -eq 1 ]]; then
+    echo "[INFO] Conversion job: $CONVERT_JOB_ID"
+else
+    echo "[INFO] Conversion job: skipped (already consolidated)"
+fi
+[[ -n "$MATH_JOB_ID" ]] && echo "[INFO] Math500 job:   $MATH_JOB_ID ($dependency_note)"
+[[ -n "$AIME_JOB_ID" ]] && echo "[INFO] AIME2025 job:  $AIME_JOB_ID ($dependency_note)"
+[[ -n "$LCB_JOB_ID" ]] && echo "[INFO] LCB job:       $LCB_JOB_ID ($dependency_note)"
 echo "[INFO] Submission manifest: $manifest_path"

@@ -29,6 +29,21 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+_RAY_GPU_ENV_VARS_TO_STRIP = (
+    "GPU_DEVICE_ORDINAL",
+    "__AUTO_CUDA_VISIBLE_DEVICES",
+    "__AUTO_GPU_DEVICE_ORDINAL",
+)
+
+
+def _normalize_cuda_visible_devices(env_vars: dict[str, str]) -> None:
+    cuda_visible_devices = env_vars.get("CUDA_VISIBLE_DEVICES")
+    if cuda_visible_devices is None:
+        return
+    env_vars["CUDA_VISIBLE_DEVICES"] = ",".join(
+        device.strip() for device in cuda_visible_devices.split(",")
+    )
+
 
 class ClusterConfig(TypedDict):
     gpus_per_node: int
@@ -101,11 +116,14 @@ def init_ray(log_dir: Optional[str] = None) -> None:
     # Set up runtime environment
     env_vars = dict(os.environ)
     env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
+    for env_var in _RAY_GPU_ENV_VARS_TO_STRIP:
+        env_vars.pop(env_var, None)
+    _normalize_cuda_visible_devices(env_vars)
     runtime_env = {
         "env_vars": env_vars,  # Pass thru all user environment variables
     }
 
-    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "ALL")
+    cvd = env_vars.get("CUDA_VISIBLE_DEVICES", "ALL")
     # sort cvd to ensure consistent tag
     cvd = ",".join(sorted(cvd.split(",")))
     cvd_tag_prefix = "nrl_tag_"

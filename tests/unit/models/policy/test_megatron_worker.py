@@ -1553,6 +1553,10 @@ def topk_setup(request):
         (2, 2, 1, None, True, "tiny_llama_model_path"),
         (2, 1, 1, None, True, "tiny_qwen2_model_path"),
         (2, 2, 1, None, True, "tiny_qwen2_model_path"),
+        (2, 1, 1, 16, None, "tiny_llama_model_path"),
+        (2, 2, 1, 16, None, "tiny_llama_model_path"),
+        (2, 1, 1, 16, None, "tiny_qwen2_model_path"),
+        (2, 2, 1, 16, None, "tiny_qwen2_model_path"),
         (2, 1, 1, 16, True, "tiny_llama_model_path"),
         (2, 2, 1, 16, True, "tiny_llama_model_path"),
         (2, 1, 1, 16, True, "tiny_qwen2_model_path"),
@@ -1568,6 +1572,10 @@ def topk_setup(request):
         "2gpu_tp2_deferfp32_llama",
         "2gpu_dp2_deferfp32_qwen2",
         "2gpu_tp2_deferfp32_qwen2",
+        "2gpu_dp2_chunked_llama",
+        "2gpu_tp2_chunked_llama",
+        "2gpu_dp2_chunked_qwen2",
+        "2gpu_tp2_chunked_qwen2",
         "2gpu_dp2_chunked_deferfp32_llama",
         "2gpu_tp2_chunked_deferfp32_llama",
         "2gpu_dp2_chunked_deferfp32_qwen2",
@@ -1629,6 +1637,138 @@ def test_megatron_policy_topk_logits(topk_setup):
         assert (diffs >= -1e-6).all(), "Top-k logits should be non-increasing across k"
 
 
+@pytest.mark.timeout(300)
+@pytest.mark.hf_gated
+@pytest.mark.parametrize(
+    "tp,defer_fp32_logits,model_fixture_name",
+    [
+        (1, False, "tiny_llama_model_path"),
+        (2, False, "tiny_llama_model_path"),
+        (1, False, "tiny_qwen2_model_path"),
+        (2, False, "tiny_qwen2_model_path"),
+        (1, True, "tiny_llama_model_path"),
+        (2, True, "tiny_llama_model_path"),
+        (1, True, "tiny_qwen2_model_path"),
+        (2, True, "tiny_qwen2_model_path"),
+    ],
+    ids=[
+        "tp1_llama",
+        "tp2_llama",
+        "tp1_qwen2",
+        "tp2_qwen2",
+        "tp1_deferfp32_llama",
+        "tp2_deferfp32_llama",
+        "tp1_deferfp32_qwen2",
+        "tp2_deferfp32_qwen2",
+    ],
+)
+def test_megatron_policy_topk_chunked_matches_non_chunked(
+    request, tp, defer_fp32_logits, model_fixture_name
+):
+    """Chunked LM-head top-k should match the unchunked result on valid positions."""
+    model_name = request.getfixturevalue(model_fixture_name)
+    cluster = None
+    policy_no_chunk = None
+    policy_chunked = None
+
+    try:
+        cluster_name = f"test-megatron-topk-match-tp{tp}-chunked"
+        cluster = RayVirtualCluster(
+            name=cluster_name,
+            bundle_ct_per_node_list=[2],
+            use_gpus=True,
+            num_gpus_per_node=2,
+            max_colocated_worker_groups=1,
+        )
+
+        converter_type = "LlamaForCausalLM"
+        if "qwen" in model_name.lower():
+            converter_type = "Qwen2ForCausalLM"
+        elif "gemma" in model_name.lower():
+            converter_type = "GemmaForCausalLM"
+
+        no_chunk_config = create_megatron_test_config(
+            model_name=model_name,
+            tp=tp,
+            pp=1,
+            converter_type=converter_type,
+            logprob_chunk_size=None,
+            defer_fp32_logits=defer_fp32_logits,
+        )
+        tokenizer = get_tokenizer(no_chunk_config["tokenizer"])
+        no_chunk_config["generation"] = configure_generation_config(
+            no_chunk_config["generation"], tokenizer
+        )
+
+        chunked_config = create_megatron_test_config(
+            model_name=model_name,
+            tp=tp,
+            pp=1,
+            converter_type=converter_type,
+            logprob_chunk_size=8,
+            defer_fp32_logits=defer_fp32_logits,
+        )
+        chunked_config["generation"] = configure_generation_config(
+            chunked_config["generation"], tokenizer
+        )
+
+        torch.manual_seed(77)
+        input_ids = torch.randint(0, 32000, (4, 64))
+        attention_mask = torch.ones(4, 64)
+        input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+        data = BatchedDataDict(
+            {
+                "input_ids": input_ids,
+                "input_lengths": input_lengths,
+                "attention_mask": attention_mask,
+            }
+        )
+
+        policy_no_chunk = Policy(
+            cluster=cluster,
+            config=no_chunk_config,
+            tokenizer=tokenizer,
+            init_reference_model=False,
+        )
+        policy_no_chunk.prepare_for_lp_inference()
+        k = 5
+        out_no_chunk = policy_no_chunk.get_topk_logits(data, k=k)
+        policy_no_chunk.shutdown()
+        policy_no_chunk = None
+
+        policy_chunked = Policy(
+            cluster=cluster,
+            config=chunked_config,
+            tokenizer=tokenizer,
+            init_reference_model=False,
+        )
+        policy_chunked.prepare_for_lp_inference()
+        out_chunked = policy_chunked.get_topk_logits(data, k=k)
+
+        logits_no_chunk = out_no_chunk["topk_logits"]
+        logits_chunked = out_chunked["topk_logits"]
+        indices_no_chunk = out_no_chunk["topk_indices"]
+        indices_chunked = out_chunked["topk_indices"]
+        valid_mask = attention_mask.bool().unsqueeze(-1).expand(-1, -1, k)
+
+        torch.testing.assert_close(
+            logits_no_chunk[valid_mask],
+            logits_chunked[valid_mask],
+            rtol=1e-3,
+            atol=1e-2,
+        )
+        assert torch.equal(indices_no_chunk[valid_mask], indices_chunked[valid_mask]), (
+            "Chunked top-k indices should match the unchunked path on valid positions"
+        )
+    finally:
+        if policy_no_chunk:
+            policy_no_chunk.shutdown()
+        if policy_chunked:
+            policy_chunked.shutdown()
+        if cluster:
+            cluster.shutdown()
+
+
 @pytest.mark.hf_gated
 @pytest.mark.timeout(300)
 def test_megatron_context_parallel_topk_agreement(tiny_qwen2_model_path):
@@ -1674,6 +1814,7 @@ def test_megatron_context_parallel_topk_agreement(tiny_qwen2_model_path):
     )
     # Ensure context parallel is disabled
     config_no_cp["megatron_cfg"]["context_parallel_size"] = 1
+    config_no_cp["logprob_chunk_size"] = 16
 
     # Enable sequence packing
     config_no_cp["sequence_packing"] = {
@@ -1748,6 +1889,7 @@ def test_megatron_context_parallel_topk_agreement(tiny_qwen2_model_path):
     )
     # Enable context parallel
     config_cp["megatron_cfg"]["context_parallel_size"] = 2
+    config_cp["logprob_chunk_size"] = 16
 
     # Enable sequence packing
     config_cp["sequence_packing"] = {

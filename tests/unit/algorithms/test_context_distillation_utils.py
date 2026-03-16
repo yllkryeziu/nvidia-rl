@@ -147,12 +147,46 @@ def test_build_teacher_batch_truncation_and_drop_too_long_response():
         max_teacher_sequence_length=5,
         pad_token_id=tokenizer.pad_token_id,
         extra_env_infos=[{"problem": "u v"}, {"problem": "q"}],
+        overflow_policy="truncate_prefix_from_end",
     )
 
     assert result.valid_sample_indices == [0]
     assert result.sample_mask.tolist() == [1.0, 0.0]
     assert result.metrics["context_distillation_prefix_truncation_count"] == 1.0
     assert result.metrics["context_distillation_dropped_too_long_response"] == 1.0
+
+
+def test_build_teacher_batch_truncate_prefix_from_end_preserves_prompt_start():
+    tokenizer = DummyTokenizer()
+    message_logs = [
+        [
+            _message("user", "u v", [1, 2]),
+            _message("assistant", "<think>a b c d e</think> ans", [3, 4, 5]),
+        ],
+    ]
+
+    result = build_context_distillation_teacher_batch(
+        message_logs=message_logs,  # type: ignore[arg-type]
+        sample_mask=torch.tensor([1.0], dtype=torch.float32),
+        student_input_lengths=torch.tensor([5], dtype=torch.long),
+        tokenizer=tokenizer,
+        teacher_prefix_template="tok0 tok1 tok2 tok3 tok4 {problem} {trace}",
+        max_teacher_sequence_length=5,
+        pad_token_id=tokenizer.pad_token_id,
+        extra_env_infos=[{"problem": "u v"}],
+        overflow_policy="truncate_prefix_from_end",
+    )
+
+    assert result.teacher_data is not None
+    assert result.valid_sample_indices == [0]
+    alignment = result.alignments[0]
+    # Response length is 3, so the prefix budget is 2 tokens. The new overflow
+    # mode should preserve the start of the teacher prompt rather than the tail.
+    assert result.teacher_data["input_ids"][0, :2].tolist() == [1, 2]
+    assert result.teacher_data["input_ids"][0, 2:5].tolist() == [3, 4, 5]
+    assert alignment.teacher_pred_start == 1
+    assert alignment.num_response_tokens == 3
+    assert result.metrics["context_distillation_prefix_truncation_count"] == 1.0
 
 
 def test_build_teacher_batch_static_trace_source_uses_dataset_answer():

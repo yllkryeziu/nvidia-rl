@@ -33,6 +33,21 @@ from nemo_rl.utils.venvs import (
     create_local_venv_on_each_node,
 )
 
+_RAY_GPU_ENV_VARS_TO_STRIP = (
+    "GPU_DEVICE_ORDINAL",
+    "__AUTO_CUDA_VISIBLE_DEVICES",
+    "__AUTO_GPU_DEVICE_ORDINAL",
+)
+
+
+def _normalize_cuda_visible_devices(env_vars: dict[str, str]) -> None:
+    cuda_visible_devices = env_vars.get("CUDA_VISIBLE_DEVICES")
+    if cuda_visible_devices is None:
+        return
+    env_vars["CUDA_VISIBLE_DEVICES"] = ",".join(
+        device.strip() for device in cuda_visible_devices.split(",")
+    )
+
 
 @dataclass
 class MultiWorkerFuture:
@@ -433,6 +448,7 @@ class RayWorkerGroup:
         for k, v in os.environ.items():
             if k not in env_vars:
                 env_vars[k] = v
+        _normalize_cuda_visible_devices(env_vars)
 
         # Get the python environment for the actor
         actor_python_env = get_actor_python_env(
@@ -504,6 +520,9 @@ class RayWorkerGroup:
                 worker_env_vars.pop("RAY_LD_PRELOAD", None)
                 worker_env_vars.pop("RAY_RAYLET_PID", None)
                 worker_env_vars.pop("RAY_USAGE_STATS_ENABLED", None)
+                for env_var in _RAY_GPU_ENV_VARS_TO_STRIP:
+                    worker_env_vars.pop(env_var, None)
+                _normalize_cuda_visible_devices(worker_env_vars)
 
                 # Only the first worker in each group gets bundle_indices
                 # This ensures only one worker per group is the model owner

@@ -116,6 +116,7 @@ class ContextDistillationRuntimeConfig(TypedDict):
     overflow_policy: str
     metrics_enabled: bool
     teacher_max_sequence_length: int
+    teacher_make_sequence_length_divisible_by: int
 
 
 class DistillationRoleResourcesConfig(TypedDict):
@@ -377,6 +378,9 @@ def _populate_teacher_topk_for_train_data(
             overflow_policy=context_runtime_cfg["overflow_policy"],
             metrics_enabled=context_runtime_cfg["metrics_enabled"],
             debug_print_first_sample=debug_print_first_sample,
+            make_sequence_length_divisible_by=context_runtime_cfg[
+                "teacher_make_sequence_length_divisible_by"
+            ],
         )
         debug_dump_printed = context_batch.debug_dump_printed
         train_data["sample_mask"] = context_batch.sample_mask
@@ -1363,6 +1367,9 @@ def distillation_train(
         "overflow_policy": context_overflow_policy,
         "metrics_enabled": context_metrics_enabled,
         "teacher_max_sequence_length": context_teacher_max_sequence_length,
+        "teacher_make_sequence_length_divisible_by": master_config["teacher"][
+            "make_sequence_length_divisible_by"
+        ],
     }
 
     if teacher_should_stay_resident:
@@ -1866,6 +1873,9 @@ def validate(
                     "max_total_sequence_length",
                     master_config["policy"]["max_total_sequence_length"],
                 ),
+                "teacher_make_sequence_length_divisible_by": master_config["teacher"][
+                    "make_sequence_length_divisible_by"
+                ],
             }
 
     max_val_samples = master_config["distillation"]["max_val_samples"]

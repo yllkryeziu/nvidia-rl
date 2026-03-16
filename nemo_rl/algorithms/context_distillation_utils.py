@@ -187,6 +187,7 @@ def build_context_distillation_teacher_batch(
     overflow_policy: str = "truncate_prefix_only",
     metrics_enabled: bool = True,
     debug_print_first_sample: bool = False,
+    make_sequence_length_divisible_by: int = 1,
 ) -> ContextDistillationBuildResult:
     if problem_source != "original_user_problem":
         raise ValueError(f"Unsupported problem_source for V1: {problem_source}")
@@ -208,10 +209,15 @@ def build_context_distillation_teacher_batch(
             "Unsupported missing_trace_policy for context distillation: "
             f"{missing_trace_policy}"
         )
-    if overflow_policy != "truncate_prefix_only":
+    if overflow_policy not in {
+        "truncate_prefix_only",
+        "truncate_prefix_from_end",
+    }:
         raise ValueError(f"Unsupported overflow_policy for V1: {overflow_policy}")
     if max_teacher_sequence_length <= 0:
         raise ValueError("max_teacher_sequence_length must be positive.")
+    if make_sequence_length_divisible_by <= 0:
+        raise ValueError("make_sequence_length_divisible_by must be positive.")
     if len(extra_env_infos) != len(message_logs):
         raise ValueError(
             "extra_env_infos length must match message_logs length for context distillation."
@@ -351,7 +357,12 @@ def build_context_distillation_teacher_batch(
             continue
 
         if int(prefix_tokens.numel()) > prefix_budget:
-            prefix_tokens = prefix_tokens[-prefix_budget:]
+            if overflow_policy == "truncate_prefix_from_end":
+                # Preserve the start of the teacher prompt so the instruction remains visible.
+                prefix_tokens = prefix_tokens[:prefix_budget]
+            else:
+                # Backwards-compatible fallback that preserves the tail of the prefix instead.
+                prefix_tokens = prefix_tokens[-prefix_budget:]
             prefix_truncation_count += 1
 
         if int(prefix_tokens.numel()) == 0:
@@ -389,6 +400,9 @@ def build_context_distillation_teacher_batch(
     teacher_data: BatchedDataDict[GenerationDatumSpec] | None = None
     if teacher_sequences:
         max_len = max(teacher_lengths)
+        remainder = max_len % make_sequence_length_divisible_by
+        if remainder != 0:
+            max_len += make_sequence_length_divisible_by - remainder
         padded = torch.full(
             (len(teacher_sequences), max_len),
             fill_value=pad_token_id,

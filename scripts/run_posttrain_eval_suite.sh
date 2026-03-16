@@ -14,11 +14,49 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NEMO_DIR="$(realpath "$SCRIPT_DIR/..")"
 cd "$NEMO_DIR"
 
+resolve_eval_cache_root() {
+    if [[ -n "${EVAL_CACHE_ROOT:-}" ]]; then
+        printf '%s\n' "$EVAL_CACHE_ROOT"
+        return
+    fi
+
+    local scratch_root="${SCRATCH_envcomp:-${SCRATCH:-}}"
+    if [[ -n "$scratch_root" ]]; then
+        printf '%s\n' "$scratch_root/yll/runtime-cache/evals"
+        return
+    fi
+
+    printf '%s\n' "$NEMO_DIR/.cache/runtime/evals"
+}
+
 export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-$NEMO_DIR/.venv}"
 export HF_HOME="${HF_HOME:-/p/project1/envcomp/yll/.cache/huggingface}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$HF_HOME/datasets}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV="${RAY_ENABLE_UV_RUN_RUNTIME_ENV:-0}"
+
+EVAL_CACHE_ROOT="$(resolve_eval_cache_root)"
+export EVAL_CACHE_ROOT
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$EVAL_CACHE_ROOT/xdg-cache}"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$EVAL_CACHE_ROOT/xdg-config}"
+export NEMO_RL_VLLM_CACHE_BASE="${NEMO_RL_VLLM_CACHE_BASE:-$EVAL_CACHE_ROOT/vllm}"
+export NEMO_RL_VLLM_CONFIG_BASE="${NEMO_RL_VLLM_CONFIG_BASE:-$EVAL_CACHE_ROOT/vllm-config}"
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$XDG_CACHE_HOME/torch_inductor}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$XDG_CACHE_HOME/triton}"
+export FLASHINFER_CACHE_DIR="${FLASHINFER_CACHE_DIR:-$XDG_CACHE_HOME/flashinfer}"
+export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$XDG_CACHE_HOME/torch_extensions}"
+export VLLM_NO_USAGE_STATS="${VLLM_NO_USAGE_STATS:-1}"
+export VLLM_DO_NOT_TRACK="${VLLM_DO_NOT_TRACK:-1}"
+mkdir -p \
+    "$XDG_CACHE_HOME" \
+    "$XDG_CONFIG_HOME" \
+    "$NEMO_RL_VLLM_CACHE_BASE" \
+    "$NEMO_RL_VLLM_CONFIG_BASE" \
+    "$TORCHINDUCTOR_CACHE_DIR" \
+    "$TRITON_CACHE_DIR" \
+    "$FLASHINFER_CACHE_DIR" \
+    "$TORCH_EXTENSIONS_DIR"
+echo "[INFO] Eval cache root: $EVAL_CACHE_ROOT"
 
 TRAIN_JOB_ID="${TRAIN_JOB_ID:-unknown}"
 EVAL_JOB_ID="${EVAL_JOB_ID:-${SLURM_JOB_ID:-unknown}}"
@@ -33,6 +71,11 @@ RUN_AIME2025="${RUN_AIME2025:-1}"
 RUN_MATH500="${RUN_MATH500:-1}"
 MATH_AIME_GPUS="${MATH_AIME_GPUS:-4}"
 ENV_MATH_NUM_WORKERS="${ENV_MATH_NUM_WORKERS:-32}"
+MATH_AIME_METRIC="${MATH_AIME_METRIC:-pass@k}"
+MATH_AIME_K_VALUE="${MATH_AIME_K_VALUE:-1}"
+MATH_AIME_NUM_TESTS_PER_PROMPT="${MATH_AIME_NUM_TESTS_PER_PROMPT:-16}"
+MATH_AIME_VARIANT_SUFFIX="avg${MATH_AIME_NUM_TESTS_PER_PROMPT}"
+EVAL_CONFIG_PREFIX="${EVAL_CONFIG_PREFIX:-}"
 EVAL_DEPENDENCY_KIND="${EVAL_DEPENDENCY_KIND:-afterany}"
 
 CHECKPOINT_DIR_OVERRIDE="${CHECKPOINT_DIR_OVERRIDE:-}"
@@ -41,6 +84,19 @@ METRIC_NAME_OVERRIDE="${METRIC_NAME_OVERRIDE:-val:accuracy}"
 HIGHER_IS_BETTER_OVERRIDE="${HIGHER_IS_BETTER_OVERRIDE:-1}"
 EXPERIMENT_NAME_OVERRIDE="${EXPERIMENT_NAME_OVERRIDE:-}"
 KEEP_TOP_K_OVERRIDE="${KEEP_TOP_K_OVERRIDE:-}"
+
+if [[ -z "$MATH_AIME_METRIC" ]]; then
+    echo "[ERROR] MATH_AIME_METRIC must be non-empty." >&2
+    exit 2
+fi
+if ! [[ "$MATH_AIME_K_VALUE" =~ ^[0-9]+$ ]] || [[ "$MATH_AIME_K_VALUE" -lt 1 ]]; then
+    echo "[ERROR] MATH_AIME_K_VALUE must be a positive integer (got: $MATH_AIME_K_VALUE)." >&2
+    exit 2
+fi
+if ! [[ "$MATH_AIME_NUM_TESTS_PER_PROMPT" =~ ^[0-9]+$ ]] || [[ "$MATH_AIME_NUM_TESTS_PER_PROMPT" -lt 1 ]]; then
+    echo "[ERROR] MATH_AIME_NUM_TESTS_PER_PROMPT must be a positive integer (got: $MATH_AIME_NUM_TESTS_PER_PROMPT)." >&2
+    exit 2
+fi
 
 if [[ -n "$CHECKPOINT_DIR_OVERRIDE" || -n "$BASE_MODEL_OVERRIDE" ]]; then
     if [[ -z "$CHECKPOINT_DIR_OVERRIDE" || -z "$BASE_MODEL_OVERRIDE" ]]; then
@@ -124,6 +180,22 @@ else
     RECIPE_HIGHER_IS_BETTER=0
 fi
 
+# Auto-detect eval config prefix from base model path if not explicitly set.
+if [[ -z "$EVAL_CONFIG_PREFIX" ]]; then
+    case "$RECIPE_BASE_MODEL" in
+        *[Qq]wen3-1.7[Bb]*|*[Qq]wen3-1[Bb]7*) EVAL_CONFIG_PREFIX="qwen3_1b7" ;;
+        *[Qq]wen3-8[Bb]*)                       EVAL_CONFIG_PREFIX="qwen3_8b" ;;
+        *[Qq]wen3-14[Bb]*)                      EVAL_CONFIG_PREFIX="qwen3_14b" ;;
+        *)
+            echo "[WARN] Could not auto-detect model size from base model path: $RECIPE_BASE_MODEL"
+            echo "[WARN] Falling back to EVAL_CONFIG_PREFIX=qwen3_1b7. Set EVAL_CONFIG_PREFIX to override."
+            EVAL_CONFIG_PREFIX="qwen3_1b7"
+            ;;
+    esac
+fi
+RESOLVED_EVAL_CONFIG_PREFIX="$EVAL_CONFIG_PREFIX"
+echo "[INFO] Eval config prefix: $RESOLVED_EVAL_CONFIG_PREFIX"
+
 RUN_TAG="${RUN_TAG:-}"
 if [[ -z "$RUN_TAG" ]]; then
     if [[ "$TRAIN_JOB_ID" != "unknown" && "$EVAL_JOB_ID" != "unknown" ]]; then
@@ -168,11 +240,11 @@ doc = {
     "evaluable_steps": [s for s in "$evaluable_steps_csv".split(",") if s],
     "models": [m for m in "$model_labels_csv".split(",") if m],
     "benchmarks": [b for b in [
-        "aime2025_avg16" if "$RUN_AIME2025" in ("1","true","TRUE","yes","YES","on","ON") else None,
-        "math500_avg16" if "$RUN_MATH500" in ("1","true","TRUE","yes","YES","on","ON") else None,
+        "aime2025_${MATH_AIME_VARIANT_SUFFIX}" if "$RUN_AIME2025" in ("1","true","TRUE","yes","YES","on","ON") else None,
+        "math500_${MATH_AIME_VARIANT_SUFFIX}" if "$RUN_MATH500" in ("1","true","TRUE","yes","YES","on","ON") else None,
         "livecodebench_official" if "$RUN_LCB" in ("1","true","TRUE","yes","YES","on","ON") else None,
     ] if b is not None],
-    "math_aime_mode": "pass@1_avg@16",
+    "math_aime_mode": "$MATH_AIME_METRIC@${MATH_AIME_K_VALUE}_avg@${MATH_AIME_NUM_TESTS_PER_PROMPT}",
     "lcb_mode": "official_as_is",
     "status": "$status",
 }
@@ -253,13 +325,14 @@ run_math_eval() {
     local model_label="$1"
     local model_path="$2"
     local dataset="$3"
-    local variant="${dataset}_avg16"
+    local variant="${dataset}_${MATH_AIME_VARIANT_SUFFIX}"
     local save_path="$MODELS_ROOT/${model_label}/${variant}"
     local log_path="$save_path/run.log"
-    local cfg_path="examples/configs/evals/qwen3_1b7_${dataset}.yaml"
+    local cfg_path="examples/configs/evals/${RESOLVED_EVAL_CONFIG_PREFIX}_${dataset}.yaml"
     mkdir -p "$save_path"
 
-    echo "[INFO] Running ${dataset} avg@16 for ${model_label}"
+    echo "[INFO] Running ${dataset} for ${model_label}"
+    echo "       metric: ${MATH_AIME_METRIC} (k=${MATH_AIME_K_VALUE}, tests=${MATH_AIME_NUM_TESTS_PER_PROMPT})"
     echo "       model:  $model_path"
     echo "       output: $save_path"
 
@@ -268,9 +341,9 @@ run_math_eval() {
         --config "$cfg_path" \
         generation.model_name="$model_path" \
         eval.save_path="$save_path" \
-        eval.metric=pass@k \
-        eval.k_value=1 \
-        eval.num_tests_per_prompt=16 \
+        eval.metric="$MATH_AIME_METRIC" \
+        eval.k_value="$MATH_AIME_K_VALUE" \
+        eval.num_tests_per_prompt="$MATH_AIME_NUM_TESTS_PER_PROMPT" \
         cluster.gpus_per_node="$MATH_AIME_GPUS" \
         env.math.num_workers="$ENV_MATH_NUM_WORKERS" \
         2>&1 | tee "$log_path"
@@ -285,15 +358,18 @@ run_math_eval() {
     fi
 
     if [[ -f "$save_path/config.json" ]]; then
-        if ! uv run python - "$save_path/config.json" "$dataset" <<'PY'
+        if ! uv run python - "$save_path/config.json" "$dataset" "$MATH_AIME_METRIC" "$MATH_AIME_K_VALUE" "$MATH_AIME_NUM_TESTS_PER_PROMPT" <<'PY'
 import json
 import sys
 cfg = json.load(open(sys.argv[1]))
 dataset = sys.argv[2]
+expected_metric = sys.argv[3]
+expected_k = int(sys.argv[4])
+expected_num_tests = int(sys.argv[5])
 assert cfg.get("dataset_name") == dataset, cfg
-assert cfg.get("metric") == "pass@k", cfg
-assert cfg.get("k_value") == 1, cfg
-assert cfg.get("num_tests_per_prompt") == 16, cfg
+assert cfg.get("metric") == expected_metric, cfg
+assert cfg.get("k_value") == expected_k, cfg
+assert cfg.get("num_tests_per_prompt") == expected_num_tests, cfg
 PY
         then
             echo "[ERROR] Saved config validation failed for $save_path" >&2
@@ -355,8 +431,8 @@ fi
 
 set +e
 enabled_benchmarks=()
-bool_is_true "$RUN_AIME2025" && enabled_benchmarks+=("aime2025_avg16")
-bool_is_true "$RUN_MATH500" && enabled_benchmarks+=("math500_avg16")
+bool_is_true "$RUN_AIME2025" && enabled_benchmarks+=("aime2025_${MATH_AIME_VARIANT_SUFFIX}")
+bool_is_true "$RUN_MATH500" && enabled_benchmarks+=("math500_${MATH_AIME_VARIANT_SUFFIX}")
 bool_is_true "$RUN_LCB" && enabled_benchmarks+=("livecodebench")
 benchmarks_csv="$(IFS=,; echo "${enabled_benchmarks[*]:-}")"
 uv run python "$NEMO_DIR/scripts/summarize_eval_run.py" --run-root "$RUN_ROOT" --benchmarks "$benchmarks_csv"

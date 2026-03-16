@@ -37,6 +37,24 @@ from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
+def _normalize_cuda_visible_devices(env_vars: dict[str, str]) -> None:
+    cuda_visible_devices = env_vars.get("CUDA_VISIBLE_DEVICES")
+    if cuda_visible_devices is None:
+        return
+    env_vars["CUDA_VISIBLE_DEVICES"] = ",".join(
+        device.strip() for device in cuda_visible_devices.split(",")
+    )
+
+
+def _resolve_vllm_worker_path(
+    env_var_name: str, default_suffix: str, seed: int
+) -> str:
+    base_path = os.environ.get(env_var_name)
+    if base_path:
+        return os.path.join(os.path.expanduser(base_path), f"vllm_{seed}")
+    return os.path.expanduser(default_suffix.format(seed=seed))
+
+
 # Use a base class to share some functions to avoid code duplication.
 class BaseVllmGenerationWorker:
     def __repr__(self) -> str:
@@ -69,6 +87,9 @@ class BaseVllmGenerationWorker:
         resources: dict[str, Any] = {"num_gpus": num_gpus}
         init_kwargs: dict[str, Any] = {}
         env_vars: dict[str, str] = {}
+        if "CUDA_VISIBLE_DEVICES" in os.environ:
+            env_vars["CUDA_VISIBLE_DEVICES"] = os.environ["CUDA_VISIBLE_DEVICES"]
+            _normalize_cuda_visible_devices(env_vars)
 
         local_bundle_indices = None
         if bundle_indices is not None:
@@ -94,7 +115,12 @@ class BaseVllmGenerationWorker:
             init_kwargs["seed"] = seed
             # Need to give each DP group its own vllm cache to address:
             # https://github.com/vllm-project/vllm/issues/18851
-            env_vars["VLLM_CACHE_ROOT"] = os.path.expanduser(f"~/.cache/vllm_{seed}")
+            env_vars["VLLM_CACHE_ROOT"] = _resolve_vllm_worker_path(
+                "NEMO_RL_VLLM_CACHE_BASE", "~/.cache/vllm_{seed}", seed
+            )
+            env_vars["VLLM_CONFIG_ROOT"] = _resolve_vllm_worker_path(
+                "NEMO_RL_VLLM_CONFIG_BASE", "~/.config/vllm_{seed}", seed
+            )
 
         # Check if this worker is part of a parallel group (TP or TP+PP).
         # A worker is part of a parallel group if it's a secondary member (local_bundle_indices is None)
@@ -166,18 +192,18 @@ class BaseVllmGenerationWorker:
 
         logger = init_logger("vllm_patch")
 
-        def _get_vllm_file(relative_path: str) -> str:
-            """Return absolute path to a vLLM file or raise if it cannot be found.
+        def _get_package_file(package_name: str, relative_path: str) -> str:
+            """Return absolute path to a package file or raise if it cannot be found.
 
             The relative_path should be a POSIX-style path under the vllm
             package root, e.g. "v1/executor/ray_executor.py" or
             "attention/layer.py".
             """
-            spec = find_spec("vllm")
+            spec = find_spec(package_name)
             if spec is None or not spec.submodule_search_locations:
                 raise RuntimeError(
-                    "vLLM package not found while attempting to patch "
-                    f"'{relative_path}'. Ensure vLLM is installed and "
+                    f"{package_name} package not found while attempting to patch "
+                    f"'{relative_path}'. Ensure {package_name} is installed and "
                     "available in this environment."
                 )
 
@@ -186,19 +212,27 @@ class BaseVllmGenerationWorker:
 
             if not os.path.exists(file_path):
                 raise RuntimeError(
-                    "Failed to locate expected vLLM file to patch. "
+                    f"Failed to locate expected {package_name} file to patch. "
                     f"Looked for '{relative_path}' at '{file_path}'. "
-                    "This likely indicates an unexpected vLLM installation "
+                    f"This likely indicates an unexpected {package_name} installation "
                     "layout or version mismatch."
                 )
 
             return file_path
+
+        def _get_vllm_file(relative_path: str) -> str:
+            return _get_package_file("vllm", relative_path)
+
+        def _get_ray_file(relative_path: str) -> str:
+            return _get_package_file("ray", relative_path)
 
         def _patch_vllm_init_workers_ray():
             """Patch the vLLM ray_distributed_executor.py file.
 
             1. Pass custom runtime_env in _init_workers_ray call.
                 - This allows passing custom py_executable to worker initialization.
+                - It also strips inherited GPU visibility env vars so Ray can
+                  assign inner vLLM worker GPUs consistently.
             2. Add NCCL_CUMEM_ENABLE and NCCL_NVLS_ENABLE to vLLM ADDITIONAL_ENV_VARS.
                 - This is a workaround to fix async vllm in some scenarios.
                 - See https://github.com/NVIDIA-NeMo/RL/pull/898 for more details.
@@ -208,27 +242,86 @@ class BaseVllmGenerationWorker:
             with open(file_to_patch, "r") as f:
                 content = f.read()
 
-            old_lines = [
-                "self._init_workers_ray(placement_group)",
-                'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}',
-            ]
+            runtime_env_line = (
+                'self._init_workers_ray(placement_group, runtime_env={"py_executable": '
+                f'"{self.py_executable}", "env_vars": (dict((k, v) for k, v in os.environ.items() '
+                'if k not in {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", '
+                '"CUDA_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL", '
+                '"__AUTO_CUDA_VISIBLE_DEVICES", "__AUTO_GPU_DEVICE_ORDINAL"}) '
+                '| {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": ""})})'
+            )
+            additional_env_vars_line = (
+                'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", '
+                '"NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE", '
+                '"RAY_ENABLE_UV_RUN_RUNTIME_ENV"}'
+            )
 
-            new_lines = [
-                f'self._init_workers_ray(placement_group, runtime_env={{"py_executable": "{self.py_executable}"}})',
-                'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE", "RAY_ENABLE_UV_RUN_RUNTIME_ENV"}',
+            replacements = [
+                (
+                    [
+                        "self._init_workers_ray(placement_group)",
+                        f'self._init_workers_ray(placement_group, runtime_env={{"py_executable": "{self.py_executable}"}})',
+                        f'self._init_workers_ray(placement_group, runtime_env={{"py_executable": "{self.py_executable}", "env_vars": {{k: v for k, v in os.environ.items() if k not in {{"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL", "__AUTO_CUDA_VISIBLE_DEVICES", "__AUTO_GPU_DEVICE_ORDINAL"}}}}}})',
+                        f'self._init_workers_ray(placement_group, runtime_env={{"py_executable": "{self.py_executable}", "env_vars": dict((k, v) for k, v in os.environ.items() if k not in {{"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL", "__AUTO_CUDA_VISIBLE_DEVICES", "__AUTO_GPU_DEVICE_ORDINAL"}})}})',
+                    ],
+                    runtime_env_line,
+                ),
+                (
+                    ['ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}'],
+                    additional_env_vars_line,
+                ),
             ]
 
             need_replace = False
-            for old_line, new_line in zip(old_lines, new_lines):
-                if new_line in content or old_line not in content:
+            for old_candidates, new_line in replacements:
+                if new_line in content:
                     continue
-                content = content.replace(old_line, new_line)
-                need_replace = True
+                for old_line in old_candidates:
+                    if old_line in content:
+                        content = content.replace(old_line, new_line)
+                        need_replace = True
+                        break
 
             if not need_replace:
                 return
 
             # Write back the patched content
+            with open(file_to_patch, "w") as f:
+                f.write(content)
+
+        def _patch_ray_worker_accelerator_mapping():
+            """Patch Ray GPU id mapping to tolerate inconsistent inherited visibility.
+
+            On JUWELS Booster, nested Ray workers can inherit a GPU visibility list
+            whose indices do not line up with the resource ids assigned by Ray.
+            Falling back to the assigned ids prevents an IndexError during worker
+            startup and lets vLLM continue with its later per-worker env update.
+            """
+            file_to_patch = _get_ray_file("_private/worker.py")
+
+            with open(file_to_patch, "r") as f:
+                content = f.read()
+
+            old_snippet = (
+                "        if self.original_visible_accelerator_ids.get(resource_name, None) is not None:\n"
+                "            original_ids = self.original_visible_accelerator_ids[resource_name]\n"
+                "            assigned_ids = {str(original_ids[i]) for i in assigned_ids}\n"
+            )
+            new_snippet = (
+                "        if self.original_visible_accelerator_ids.get(resource_name, None) is not None:\n"
+                "            original_ids = self.original_visible_accelerator_ids[resource_name]\n"
+                "            assigned_id_indices = {int(i) for i in assigned_ids}\n"
+                "            if assigned_id_indices and max(assigned_id_indices) >= len(original_ids):\n"
+                "                assigned_ids = {str(i) for i in assigned_id_indices}\n"
+                "            else:\n"
+                "                assigned_ids = {str(original_ids[i]) for i in assigned_id_indices}\n"
+            )
+
+            if new_snippet in content or old_snippet not in content:
+                return
+
+            content = content.replace(old_snippet, new_snippet)
+
             with open(file_to_patch, "w") as f:
                 f.write(content)
 
@@ -325,6 +418,9 @@ class BaseVllmGenerationWorker:
 
         _patch_vllm_speculative_decoding_post_step()
 
+        _patch_ray_worker_accelerator_mapping()
+        logger.info("Successfully patched Ray accelerator id mapping.")
+
         try:
             import vllm
 
@@ -344,8 +440,15 @@ class BaseVllmGenerationWorker:
         # Special handling for parallel case (either TP or PP or both)
         if model_parallel_size > 1:
             # Configure vLLM for tensor/pipeline parallelism within Ray
-            # Reset CUDA_VISIBLE_DEVICES to allow vLLM to manage GPU assignment
+            # Reset CUDA_VISIBLE_DEVICES to allow vLLM to manage GPU assignment.
+            # Also remove SLURM-set GPU ordering vars (e.g. GPU_DEVICE_ORDINAL on
+            # JUWELS Booster) whose space-padded values cause ValueError in Ray's
+            # AcceleratorContext when it resolves compiled-DAG device mappings.
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            os.environ.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
+            os.environ.pop("GPU_DEVICE_ORDINAL", None)
+            os.environ.pop("__AUTO_CUDA_VISIBLE_DEVICES", None)
+            os.environ.pop("__AUTO_GPU_DEVICE_ORDINAL", None)
             os.environ["VLLM_RAY_PER_WORKER_GPUS"] = str(
                 self.fraction_of_gpus / model_parallel_size
             )

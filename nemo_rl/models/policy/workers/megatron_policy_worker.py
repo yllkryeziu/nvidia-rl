@@ -722,6 +722,93 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 if self.should_disable_forward_pre_hook:
                     self.enable_forward_pre_hook()
 
+    def _unwrap_topk_projection_model(
+        self, model: torch.nn.Module
+    ) -> Optional[GPTModel]:
+        """Unwrap DDP/precision wrappers to the GPT language model used for top-k projection."""
+        unwrapped = model
+        seen_modules: set[int] = set()
+        while hasattr(unwrapped, "module") and id(unwrapped) not in seen_modules:
+            seen_modules.add(id(unwrapped))
+            unwrapped = unwrapped.module
+        if hasattr(unwrapped, "language_model"):
+            unwrapped = unwrapped.language_model
+        return unwrapped if isinstance(unwrapped, GPTModel) else None
+
+    def _compute_topk_from_hidden_states(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        model: GPTModel,
+        k: int,
+        seq_chunk_size: Optional[int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project hidden states in sequence chunks so the full logits tensor is never materialized."""
+        tp_grp = get_tensor_model_parallel_group()
+        tp_rank = get_tensor_model_parallel_rank()
+        output_weight = (
+            model.shared_embedding_or_output_weight()
+            if model.share_embeddings_and_output_weights
+            else None
+        )
+
+        hidden_seq_len = int(hidden_states.shape[0])
+        if hidden_seq_len <= 0:
+            batch_size = int(hidden_states.shape[1]) if hidden_states.dim() > 1 else 0
+            return (
+                torch.empty(
+                    (batch_size, 0, k), dtype=torch.float32, device=hidden_states.device
+                ),
+                torch.empty(
+                    (batch_size, 0, k), dtype=torch.long, device=hidden_states.device
+                ),
+            )
+
+        if seq_chunk_size is None:
+            seq_chunk_size = hidden_seq_len
+        seq_chunk_size = max(1, min(int(seq_chunk_size), hidden_seq_len))
+
+        temperature = None
+        if "generation" in self.cfg and self.cfg["generation"] is not None:
+            temperature = self.cfg["generation"]["temperature"]
+
+        topk_vals_chunks = []
+        topk_idx_chunks = []
+        for start_idx in range(0, hidden_seq_len, seq_chunk_size):
+            end_idx = min(hidden_seq_len, start_idx + seq_chunk_size)
+            hidden_states_chunk = hidden_states[start_idx:end_idx]
+            chunk_logits, _ = model.output_layer(
+                hidden_states_chunk, weight=output_weight
+            )
+            local_logits = chunk_logits.transpose(0, 1).contiguous()
+            del chunk_logits
+            if temperature is not None and temperature != 1.0:
+                local_logits.div_(temperature)
+
+            vocab_shard_size = local_logits.shape[-1]
+            topk_vals_chunk, topk_idx_chunk = distributed_vocab_topk(
+                local_logits,
+                k,
+                tp_grp,
+                vocab_start_index=tp_rank * vocab_shard_size,
+                vocab_end_index=(tp_rank + 1) * vocab_shard_size,
+            )
+            del hidden_states_chunk, local_logits
+            topk_vals_chunks.append(topk_vals_chunk)
+            topk_idx_chunks.append(topk_idx_chunk)
+
+        topk_vals = (
+            torch.cat(topk_vals_chunks, dim=1)
+            if len(topk_vals_chunks) > 1
+            else topk_vals_chunks[0]
+        )
+        topk_idx = (
+            torch.cat(topk_idx_chunks, dim=1)
+            if len(topk_idx_chunks) > 1
+            else topk_idx_chunks[0]
+        )
+        return topk_vals, topk_idx
+
     @wrap_with_nvtx_name("megatron_policy_worker/get_topk_logits")
     def get_topk_logits(
         self,
@@ -785,43 +872,78 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             if len(multimodal_data) > 0:
                 position_ids = None
 
+            topk_projection_model = self._unwrap_topk_projection_model(model)
+            use_hidden_state_topk = (
+                topk_projection_model is not None and len(multimodal_data) == 0
+            )
+
             additional_kwargs = {}
             if packed_seq_params is not None:
                 additional_kwargs["packed_seq_params"] = packed_seq_params
+            if self.defer_fp32_logits or (
+                use_hidden_state_topk and self.cfg["precision"] != "float32"
+            ):
+                additional_kwargs["fp32_output"] = False
 
-            output_tensor = model(
-                input_ids=input_ids_cp_sharded,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                **additional_kwargs,
-                **multimodal_data,
-            )
+            if use_hidden_state_topk:
+                assert topk_projection_model is not None
+                original_post_process = topk_projection_model.post_process
+                topk_projection_model.post_process = False
+                try:
+                    output_tensor = model(
+                        input_ids=input_ids_cp_sharded,
+                        position_ids=position_ids,
+                        attention_mask=attention_mask,
+                        **additional_kwargs,
+                        **multimodal_data,
+                    )
+                finally:
+                    topk_projection_model.post_process = original_post_process
+            else:
+                output_tensor = model(
+                    input_ids=input_ids_cp_sharded,
+                    position_ids=position_ids,
+                    attention_mask=attention_mask,
+                    **additional_kwargs,
+                    **multimodal_data,
+                )
 
-            if "generation" in self.cfg and self.cfg["generation"] is not None:
-                output_tensor.div_(self.cfg["generation"]["temperature"])
+                if "generation" in self.cfg and self.cfg["generation"] is not None:
+                    output_tensor.div_(self.cfg["generation"]["temperature"])
 
             def collection_fn(_):
                 # Only the last PP stage produces final logits/top-k; earlier stages return empty
                 # if not is_pipeline_last_stage(ignore_virtual=True):
                 # return output_tensor.new_zeros(()), {}
 
-                tp_grp = get_tensor_model_parallel_group()
-                tp_rank = get_tensor_model_parallel_rank()
                 vocab_shard_size = output_tensor.shape[-1]
-                vocab_start_index = tp_rank * vocab_shard_size
 
                 chunk_size = None
                 if "logprob_chunk_size" in self.cfg:
                     chunk_size = self.cfg["logprob_chunk_size"]
 
-                topk_vals_local, topk_idx_local = distributed_vocab_topk(
-                    output_tensor,
-                    k,
-                    tp_grp,
-                    vocab_start_index=vocab_start_index,
-                    vocab_end_index=vocab_start_index + vocab_shard_size,
-                    chunk_size=chunk_size,
-                )
+                if use_hidden_state_topk:
+                    assert topk_projection_model is not None
+                    topk_vals_local, topk_idx_local = (
+                        self._compute_topk_from_hidden_states(
+                            hidden_states=output_tensor,
+                            model=topk_projection_model,
+                            k=k,
+                            seq_chunk_size=chunk_size,
+                        )
+                    )
+                else:
+                    tp_grp = get_tensor_model_parallel_group()
+                    tp_rank = get_tensor_model_parallel_rank()
+                    vocab_start_index = tp_rank * vocab_shard_size
+                    topk_vals_local, topk_idx_local = distributed_vocab_topk(
+                        output_tensor,
+                        k,
+                        tp_grp,
+                        vocab_start_index=vocab_start_index,
+                        vocab_end_index=vocab_start_index + vocab_shard_size,
+                        chunk_size=chunk_size,
+                    )
 
                 if self.cfg["megatron_cfg"]["context_parallel_size"] > 1:
                     cp_grp = get_context_parallel_group()
@@ -934,27 +1056,42 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         )
 
         if is_pipeline_last_stage(ignore_virtual=True):
+            pp_size = get_pipeline_model_parallel_world_size()
             logits_chunks = []
             indices_chunks = []
             for out in list_of_outputs:
-                tk = out["topk_logits"]
-                ti = out["topk_indices"]
+                tk = out.pop("topk_logits")
+                ti = out.pop("topk_indices")
                 pad_len = seq_length - tk.shape[1]
                 if pad_len > 0:
                     tk = torch.nn.functional.pad(tk, (0, 0, 0, pad_len), value=0.0)
                     ti = torch.nn.functional.pad(ti, (0, 0, 0, pad_len), value=0)
+                if pp_size == 1:
+                    # Stage top-k tensors to CPU before concatenation to avoid
+                    # allocating a second full [B, S, k] buffer on GPU.
+                    tk = tk.cpu()
+                    ti = ti.cpu()
                 logits_chunks.append(tk)
                 indices_chunks.append(ti)
 
-            topk_logits = torch.cat(logits_chunks, dim=0)
-            topk_indices = torch.cat(indices_chunks, dim=0)
+            topk_logits = (
+                torch.cat(logits_chunks, dim=0)
+                if len(logits_chunks) > 1
+                else logits_chunks[0]
+            )
+            topk_indices = (
+                torch.cat(indices_chunks, dim=0)
+                if len(indices_chunks) > 1
+                else indices_chunks[0]
+            )
 
-            topk_logits = broadcast_tensor(
-                topk_logits, torch.distributed.get_rank(), pp_grp
-            )
-            topk_indices = broadcast_tensor(
-                topk_indices, torch.distributed.get_rank(), pp_grp
-            )
+            if pp_size > 1:
+                topk_logits = broadcast_tensor(
+                    topk_logits, torch.distributed.get_rank(), pp_grp
+                )
+                topk_indices = broadcast_tensor(
+                    topk_indices, torch.distributed.get_rank(), pp_grp
+                )
         else:
             last_pp_rank = get_pipeline_model_parallel_last_rank()
             topk_logits = broadcast_tensor(None, last_pp_rank, pp_grp)

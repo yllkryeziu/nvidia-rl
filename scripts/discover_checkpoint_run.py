@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -119,6 +120,33 @@ def main() -> None:
         base_model, metric_name, higher = load_metadata_from_config(config_source)
     except Exception as e:  # noqa: BLE001
         raise SystemExit(str(e)) from e
+
+    # Remap base model path if the original filesystem is inaccessible but a
+    # local HF cache mirror exists (e.g. /fast/... -> /p/project1/.../huggingface/hub/...).
+    base_model_path = Path(base_model)
+    if not base_model_path.exists():
+        hf_home = Path(
+            os.environ.get(
+                "HF_HOME", "/p/project1/envcomp/yll/.cache/huggingface"
+            )
+        )
+        # Extract the HF hub relative portion (models--Org--Name/snapshots/hash).
+        parts = base_model_path.parts
+        hub_marker = None
+        for i, p in enumerate(parts):
+            if p.startswith("models--"):
+                hub_marker = i
+                break
+        if hub_marker is not None:
+            candidate = hf_home / "hub" / Path(*parts[hub_marker:])
+            if candidate.exists():
+                print(
+                    f"[INFO] Remapped base model path:\n"
+                    f"       from: {base_model}\n"
+                    f"       to:   {candidate}",
+                    file=sys.stderr,
+                )
+                base_model = str(candidate)
 
     result["base_model"] = base_model
     result["metric_name"] = metric_name

@@ -7,8 +7,8 @@
 # Best-practice defaults (as of 2026-02-25):
 #   - scenario=codegeneration
 #   - release_version=release_v6 (pinned for reproducibility)
-#   - n=10, temperature=0.2, top_p=0.95, max_tokens=2000
-#   - `--evaluate` to produce pass@1/pass@5 metrics
+#   - n=4, temperature=0.6, top_p=0.95, max_tokens=16384
+#   - `--evaluate` to produce pass@1/pass@4 metrics
 #   - `--continue_existing_with_eval` + `--use_cache` for resumable runs
 #
 # First run auto-clones LiveCodeBench and installs dependencies into `3rdparty/LiveCodeBench/.venv`.
@@ -159,8 +159,16 @@ setup_lcb_repo() {
 
 setup_lcb_env() {
     local install_needed=0
+    local lock_file="${LCB_VENV}.lock"
+    local lcb_lock_fd
+
+    mkdir -p "$(dirname "$LCB_VENV")"
+    exec {lcb_lock_fd}> "$lock_file"
+    flock "$lcb_lock_fd"
 
     if [[ ! -x "$LCB_VENV/bin/python" ]]; then
+        install_needed=1
+    elif ! "$LCB_VENV/bin/python" -c "import torch, vllm" >/dev/null 2>&1; then
         install_needed=1
     fi
 
@@ -172,8 +180,6 @@ setup_lcb_env() {
         echo "[INFO] Reusing LiveCodeBench environment: $LCB_VENV"
     else
         echo "[INFO] Setting up LiveCodeBench environment in: $LCB_VENV"
-        mkdir -p "$(dirname "$LCB_VENV")"
-
         pushd "$LCB_DIR" >/dev/null
         # Prefer locked env if available; fall back to editable install if sync fails.
         if ! UV_PROJECT_ENVIRONMENT="$LCB_VENV" uv sync --frozen; then
@@ -200,8 +206,13 @@ setup_lcb_env() {
         echo "[ERROR] LiveCodeBench environment setup completed but \`import lcb_runner\` still fails."
         echo "[ERROR] Repo: $LCB_DIR"
         echo "[ERROR] Venv: $LCB_VENV"
+        flock -u "$lcb_lock_fd"
+        exec {lcb_lock_fd}>&-
         exit 1
     fi
+
+    flock -u "$lcb_lock_fd"
+    exec {lcb_lock_fd}>&-
 }
 
 detect_model_key() {
@@ -350,6 +361,87 @@ print("\t".join([fmt(pass1), fmt(pass5), fmt(pass10)]))
 PY
 }
 
+read_run_info_value() {
+    local file="$1"
+    local key="$2"
+    [[ -f "$file" ]] || return 1
+    awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, "", $0); print; exit }' "$file"
+}
+
+find_latest_eval_json() {
+    local run_dir="$1"
+    local found=""
+    found="$(find "$run_dir/output" -type f -name '*_eval.json' ! -name '*_eval_all.json' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n1 | cut -d' ' -f2- || true)"
+    [[ -n "$found" && -f "$found" ]] || return 1
+    printf '%s\n' "$found"
+}
+
+is_completed_lcb_eval() {
+    local results_dir="$1"
+    local model_path="$2"
+    local summary_fpath="$results_dir/run_info.txt"
+    local metrics_fpath="$results_dir/metrics.json"
+    local run_dir="$results_dir/workspace"
+    local latest_eval_json=""
+
+    if [[ -f "$metrics_fpath" ]]; then
+        if "$LCB_PYTHON" - "$metrics_fpath" "$model_path" "$LCB_RELEASE_VERSION" "$LCB_N" "$LCB_TEMPERATURE" "$LCB_TOP_P" "$LCB_MAX_TOKENS" <<'PY'
+import json
+import sys
+
+path, model_path, release_version, n, temperature, top_p, max_tokens = sys.argv[1:]
+try:
+    doc = json.load(open(path))
+except Exception:
+    raise SystemExit(1)
+if doc.get("status") != "success":
+    raise SystemExit(1)
+if doc.get("model_path") != model_path:
+    raise SystemExit(1)
+metrics = doc.get("metrics", {})
+if str(metrics.get("samples_per_problem")) not in {n, f"{float(n):.1f}"}:
+    raise SystemExit(1)
+artifacts = doc.get("artifacts", {})
+eval_json = artifacts.get("eval_json")
+if not eval_json:
+    raise SystemExit(1)
+print("ok")
+PY
+        then
+            return 0
+        fi
+    fi
+
+    [[ -d "$run_dir" && -f "$summary_fpath" ]] || return 1
+
+    if [[ "$(read_run_info_value "$summary_fpath" "model_path" || true)" != "$model_path" ]]; then
+        return 1
+    fi
+    if [[ "$(read_run_info_value "$summary_fpath" "release_version" || true)" != "$LCB_RELEASE_VERSION" ]]; then
+        return 1
+    fi
+    if [[ "$(read_run_info_value "$summary_fpath" "n" || true)" != "$LCB_N" ]]; then
+        return 1
+    fi
+    if [[ "$(read_run_info_value "$summary_fpath" "temperature" || true)" != "$LCB_TEMPERATURE" ]]; then
+        return 1
+    fi
+    if [[ "$(read_run_info_value "$summary_fpath" "top_p" || true)" != "$LCB_TOP_P" ]]; then
+        return 1
+    fi
+    if [[ "$(read_run_info_value "$summary_fpath" "max_tokens" || true)" != "$LCB_MAX_TOKENS" ]]; then
+        return 1
+    fi
+
+    latest_eval_json="$(read_run_info_value "$summary_fpath" "latest_eval_json" || true)"
+    if [[ -n "$latest_eval_json" && -f "$latest_eval_json" ]]; then
+        return 0
+    fi
+
+    latest_eval_json="$(find_latest_eval_json "$run_dir" || true)"
+    [[ -n "$latest_eval_json" && -f "$latest_eval_json" ]]
+}
+
 run_lcb_eval() {
     local model_label="$1"
     local model_path="$2"
@@ -369,6 +461,11 @@ run_lcb_eval() {
     fi
     if [[ ! -L "$lcb_prompts_link" ]]; then
         ln -s "$LCB_DIR/lcb_runner" "$lcb_prompts_link"
+    fi
+
+    if is_completed_lcb_eval "$results_dir" "$model_path"; then
+        echo "[INFO] Skipping $model_label: existing completed LiveCodeBench results match requested config."
+        return 0
     fi
 
     {
@@ -460,7 +557,7 @@ run_lcb_eval() {
     fi
 
     local eval_json=""
-    eval_json="$(find "$run_dir/output" -type f -name '*_eval.json' ! -name '*_eval_all.json' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n1 | cut -d' ' -f2- || true)"
+    eval_json="$(find_latest_eval_json "$run_dir" || true)"
     if [[ -z "$eval_json" || ! -f "$eval_json" ]]; then
         echo "[WARN] Could not locate *_eval.json under $run_dir/output"
         echo -e "${model_label}\t${model_path}\t\t\t\t" >>"$SUMMARY_TABLE"
@@ -509,10 +606,10 @@ STEPS="${STEPS:-base 100 200}"
 
 # LiveCodeBench generation/eval defaults (official-codegen comparable).
 LCB_RELEASE_VERSION="${LCB_RELEASE_VERSION:-release_v6}"
-LCB_N="${LCB_N:-10}"
-LCB_TEMPERATURE="${LCB_TEMPERATURE:-0.2}"
+LCB_N="${LCB_N:-4}"
+LCB_TEMPERATURE="${LCB_TEMPERATURE:-0.6}"
 LCB_TOP_P="${LCB_TOP_P:-0.95}"
-LCB_MAX_TOKENS="${LCB_MAX_TOKENS:-2000}"
+LCB_MAX_TOKENS="${LCB_MAX_TOKENS:-16384}"
 LCB_TP="${LCB_TP:-4}"
 LCB_NUM_PROCESS_EVALUATE="${LCB_NUM_PROCESS_EVALUATE:-12}"
 LCB_TIMEOUT="${LCB_TIMEOUT:-6}"

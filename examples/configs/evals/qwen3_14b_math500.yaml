@@ -1,0 +1,48 @@
+# Evaluation config for Qwen3-14B on MATH500
+# TP=4 (14B needs ~28GB, does not fit on a single A100-40GB), DP=1.
+
+defaults: "eval.yaml"
+
+eval:
+  metric: "cons@k"
+  num_tests_per_prompt: 8
+  seed: 42
+  k_value: 1
+  save_path: null
+
+generation:
+  model_name: "Qwen/Qwen3-14B"
+  max_new_tokens: ${generation.vllm_cfg.max_model_len}
+  temperature: 0.6
+  top_p: 0.99
+  top_k: -1
+  num_prompts_per_step: -1
+  vllm_cfg:
+    async_engine: false
+    precision: "bfloat16"
+    tensor_parallel_size: 4
+    pipeline_parallel_size: 1
+    expert_parallel_size: 1
+    gpu_memory_utilization: 0.9
+    max_model_len: 16384
+    enforce_eager: false
+
+tokenizer:
+  name: ${generation.model_name}
+  chat_template: "default"
+  chat_template_kwargs:
+    enable_thinking: true
+
+data:
+  dataset_name: "math500"
+  max_input_seq_length: 4096
+  prompt_file: null
+  system_prompt_file: null
+
+env:
+  math:
+    num_workers: 8
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1

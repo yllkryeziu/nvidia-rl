@@ -20,10 +20,10 @@
 
 set -euo pipefail
 
-if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
-    NEMO_DIR="$(realpath "$SLURM_SUBMIT_DIR")"
-elif [[ -n "${NEMO_DIR:-}" ]]; then
+if [[ -n "${NEMO_DIR:-}" ]]; then
     NEMO_DIR="$(realpath "$NEMO_DIR")"
+elif [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+    NEMO_DIR="$(realpath "$SLURM_SUBMIT_DIR")"
 else
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     NEMO_DIR="$(realpath "$SCRIPT_DIR/..")"
