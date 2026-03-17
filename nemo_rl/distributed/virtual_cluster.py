@@ -104,6 +104,45 @@ def init_ray(log_dir: Optional[str] = None) -> None:
     runtime_env = {
         "env_vars": env_vars,  # Pass thru all user environment variables
     }
+    # Cap Ray CPU resources to Slurm allocation by default so local startup does
+    # not over-provision worker processes for the full host CPU count.
+    local_num_cpus: int
+    slurm_cpus_raw = os.environ.get("SLURM_CPUS_PER_TASK")
+    if slurm_cpus_raw:
+        try:
+            local_num_cpus = max(1, int(slurm_cpus_raw))
+        except ValueError:
+            logger.warning(
+                "Invalid SLURM_CPUS_PER_TASK=%r; falling back to os.cpu_count()",
+                slurm_cpus_raw,
+            )
+            local_num_cpus = max(1, os.cpu_count() or 1)
+    else:
+        local_num_cpus = max(1, os.cpu_count() or 1)
+
+    # Optional escape hatch: force starting a fresh local Ray runtime and skip
+    # auto-attach probing. Useful for single-node jobs where an inherited or stale
+    # RAY_ADDRESS would otherwise cause connection timeouts.
+    force_local = os.environ.get("NRL_FORCE_LOCAL_RAY", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if force_local:
+        logger.info("NRL_FORCE_LOCAL_RAY enabled; starting a fresh local Ray runtime.")
+        ray.shutdown()
+        local_runtime_env = dict(runtime_env)
+        local_runtime_env.pop("working_dir", None)
+        ray.init(
+            log_to_driver=True,
+            include_dashboard=True,
+            runtime_env=local_runtime_env,
+            _temp_dir=os.path.abspath(log_dir) if log_dir else None,
+            num_cpus=local_num_cpus,
+        )
+        logger.info(f"Started forced-local Ray cluster: {ray.cluster_resources()}")
+        return
 
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "ALL")
     # sort cvd to ensure consistent tag
@@ -171,6 +210,7 @@ def init_ray(log_dir: Optional[str] = None) -> None:
         runtime_env=local_runtime_env,
         _temp_dir=os.path.abspath(log_dir) if log_dir else None,
         resources={cvd_tag: 1},
+        num_cpus=local_num_cpus,
     )
     logger.info(
         f"Started local cluster with tag '{cvd_tag}': {ray.cluster_resources()}"

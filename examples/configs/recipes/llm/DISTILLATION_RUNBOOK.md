@@ -1,6 +1,6 @@
 # Scaled Distillation Runbook (Qwen3 1.7B / 4B / 8B / 14B)
 
-This runbook covers launching and verifying the `distill_topk512_*` distillation configs on JUWELS Booster.
+This runbook covers launching and verifying the `distill_topk512_*` distillation configs on JUWELS Booster and Berlin (H100) cluster.
 
 ## Scope
 
@@ -32,7 +32,7 @@ Common settings already baked into the `topk512` configs:
 
 Run these checks before submitting:
 
-1. Confirm you are in the `nemo-rl` repo root.
+1. Confirm you are in the `nvidia-rl` repo root.
 2. Confirm the config file exists.
 3. Confirm model snapshot paths referenced in the config exist on disk.
 4. Confirm dataset path exists (`/p/project1/envcomp/yll/openthoughts114k-math-qwen3`).
@@ -173,3 +173,131 @@ If validation is unstable:
 3. `distill_topk512_qwen3_8b.yaml`
 4. `distill_topk512_qwen3_14b.yaml`
 5. `distill_topk512_qwen3_1b7_p64_g4.yaml` (throughput stress variant)
+
+---
+
+## Berlin Cluster (H100)
+
+### Cluster Assumptions
+
+- Berlin cluster: `8` GPUs per node (H100 SXM5 80GB)
+- Max `3` nodes (24 GPUs total)
+- Partition: `standard`, Account: `hfmi_profound`
+- Slurm submission via `ray_bare_berlin.sub`
+- Source `env_berlin.sh` before submitting
+
+### Berlin Configs
+
+All configs live in `examples/configs/recipes/llm/berlin/`. Most use 3 nodes with 8 GPUs each, and one (`14b_2node`) is a 2-node split (train+teacher / generation) variant.
+
+| Config | Nodes | Training | Generation | Teacher | Notes |
+|---|---:|---|---|---|---|
+| `berlin/distill_topk512_qwen3_1b7.yaml` | 3 | 1 node, TP=2, DP=4 | 1 node, vLLM TP=1 (8 engines) | 1 node, TP=2, DP=4 | grad_accum=8 |
+| `berlin/distill_topk512_qwen3_4b.yaml` | 3 | 1 node, TP=4, DP=2 | 1 node, vLLM TP=1 (8 engines) | 1 node, TP=2, DP=4 | TP reduced from 8 |
+| `berlin/distill_topk512_qwen3_8b.yaml` | 3 | 1 node, TP=4, DP=2 | 1 node, vLLM TP=1 (8 engines) | 1 node, TP=2, DP=4 | vLLM TP=1 (8B fits H100) |
+| `berlin/distill_topk512_qwen3_14b.yaml` | 3 | 1 node, TP=8, DP=1 | 1 node, vLLM TP=2 (4 engines) | 1 node, TP=4, DP=2 | grad_accum=32, DP=1 |
+| `berlin/distill_topk512_qwen3_1b7_p64_g4.yaml` | 3 | 1 node, TP=2, DP=4 | 1 node, vLLM TP=1 (8 engines) | 1 node, TP=2, DP=4 | 8 engines (vs 16 on JUWELS) |
+| `berlin/distill_topk512_qwen3_14b_2node.yaml` | 2 | 1 node, TP=8, DP=1 | 1 node, vLLM TP=2 (4 engines), non-colocated | train node, TP=4, DP=2 | full 20k token budgets (20480) |
+
+### Berlin Preflight Checklist
+
+1. Source the environment: `source env_berlin.sh`
+2. Pin UV to this repo venv (avoids stale path from old checkout): `export UV_PROJECT_ENVIRONMENT="$PWD/.venv"`
+3. Confirm model snapshots exist under `/fast/project/HFMI_SynergyUnit/ylli/.cache/huggingface/hub/`
+4. Confirm dataset exists at `/fast/project/HFMI_SynergyUnit/ylli/openthoughts114k-math-qwen3`
+5. Confirm `ray_bare_berlin.sub` is present
+
+Quick parse check:
+
+```bash
+uv run python - <<'PY'
+import yaml
+for p in [
+    "examples/configs/recipes/llm/berlin/distill_topk512_qwen3_1b7.yaml",
+    "examples/configs/recipes/llm/berlin/distill_topk512_qwen3_4b.yaml",
+    "examples/configs/recipes/llm/berlin/distill_topk512_qwen3_8b.yaml",
+    "examples/configs/recipes/llm/berlin/distill_topk512_qwen3_14b.yaml",
+    "examples/configs/recipes/llm/berlin/distill_topk512_qwen3_1b7_p64_g4.yaml",
+]:
+    yaml.safe_load(open(p))
+    print("OK", p)
+PY
+```
+
+### Berlin Launch Commands
+
+Run once in the shell before any of the commands below:
+
+```bash
+export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
+```
+
+#### 3-node configs
+
+#### `distill_topk512_qwen3_1b7.yaml`
+
+```bash
+COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/berlin/distill_topk512_qwen3_1b7.yaml'
+sbatch -J distill_topk512_qwen3_1b7 -N3 -t 24:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_berlin.sub
+```
+
+#### `distill_topk512_qwen3_4b.yaml`
+
+```bash
+COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/berlin/distill_topk512_qwen3_4b.yaml'
+sbatch -J distill_topk512_qwen3_4b -N3 -t 24:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_berlin.sub
+```
+
+#### `distill_topk512_qwen3_8b.yaml`
+
+```bash
+COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/berlin/distill_topk512_qwen3_8b.yaml'
+sbatch -J distill_topk512_qwen3_8b -N3 -t 24:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_berlin.sub
+```
+
+#### `distill_topk512_qwen3_14b.yaml`
+
+```bash
+COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/berlin/distill_topk512_qwen3_14b.yaml'
+sbatch -J distill_topk512_qwen3_14b -N3 -t 24:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_berlin.sub
+```
+
+#### `distill_topk512_qwen3_1b7_p64_g4.yaml`
+
+```bash
+COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/berlin/distill_topk512_qwen3_1b7_p64_g4.yaml'
+sbatch -J distill_topk512_qwen3_1b7_p64_g4 -N3 -t 24:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_berlin.sub
+```
+
+#### 1-node configs (colocated)
+
+#### `distill_topk512_qwen3_8b_1node.yaml`
+
+```bash
+COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/berlin/distill_topk512_qwen3_8b_1node.yaml'
+sbatch -J distill_topk512_qwen3_8b_1node -N1 -t 24:00:00 --mem=600G --export=ALL,COMMAND="$COMMAND" ray_bare_berlin.sub
+```
+
+#### 2-node config (train/generation split)
+
+#### `distill_topk512_qwen3_14b_2node.yaml`
+
+```bash
+COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/berlin/distill_topk512_qwen3_14b_2node.yaml'
+sbatch -J distill_topk512_qwen3_14b_2node -N2 -t 24:00:00 --mem=500G --export=ALL,COMMAND="$COMMAND" ray_bare_berlin.sub
+```
+
+### Berlin OOM Guidance
+
+H100 80GB has 2x the memory of A100 40GB, so OOM is less likely. If it occurs:
+
+1. `berlin/distill_topk512_qwen3_14b_2node.yaml` baseline is split: `policy TP=8/DP=1` on 1 train node, `teacher TP=4/DP=2` on train node, and non-colocated generation on the other node (`vLLM TP=2`, `gpu_memory_utilization=0.55`).
+2. If 14B still OOMs, use this fallback sequence in order:
+   a. Reduce sequence-packing token budgets further (keep context/generation lengths unchanged): `policy.sequence_packing.{train_mb_tokens,logprob_mb_tokens}=12288` and `teacher.sequence_packing.{train_mb_tokens,logprob_mb_tokens}=12288`.
+   b. Reduce generation concurrency: `policy.generation_batch_size=2`, `teacher.generation_batch_size=2`.
+   c. Lower vLLM memory reservation: `policy.generation.vllm_cfg.gpu_memory_utilization=0.50`.
+3. For generation OOM on 8B (vLLM TP=1): reduce `gpu_memory_utilization` from 0.80 to 0.70, or switch to vLLM TP=2 (4 engines instead of 8).
+
+### Berlin Bring-Up Order
+
+Same as JUWELS: 1.7B → 4B → 8B → 14B → 1.7B p64_g4

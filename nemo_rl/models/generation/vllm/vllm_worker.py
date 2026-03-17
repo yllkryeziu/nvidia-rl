@@ -94,7 +94,13 @@ class BaseVllmGenerationWorker:
             init_kwargs["seed"] = seed
             # Need to give each DP group its own vllm cache to address:
             # https://github.com/vllm-project/vllm/issues/18851
-            env_vars["VLLM_CACHE_ROOT"] = os.path.expanduser(f"~/.cache/vllm_{seed}")
+            cache_root_base = (
+                os.environ.get("NRL_VLLM_CACHE_BASE")
+                or os.environ.get("VLLM_CACHE_ROOT_BASE")
+                or os.environ.get("XDG_CACHE_HOME")
+                or os.path.expanduser("~/.cache")
+            )
+            env_vars["VLLM_CACHE_ROOT"] = os.path.join(cache_root_base, f"vllm_{seed}")
 
         # Check if this worker is part of a parallel group (TP or TP+PP).
         # A worker is part of a parallel group if it's a secondary member (local_bundle_indices is None)
@@ -215,7 +221,7 @@ class BaseVllmGenerationWorker:
 
             new_lines = [
                 f'self._init_workers_ray(placement_group, runtime_env={{"py_executable": "{self.py_executable}"}})',
-                'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE", "RAY_ENABLE_UV_RUN_RUNTIME_ENV"}',
+                'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE", "RAY_ENABLE_UV_RUN_RUNTIME_ENV", "XDG_CACHE_HOME", "VLLM_CACHE_ROOT_BASE", "NRL_VLLM_CACHE_BASE", "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR", "CUDA_CACHE_PATH"}',
             ]
 
             need_replace = False

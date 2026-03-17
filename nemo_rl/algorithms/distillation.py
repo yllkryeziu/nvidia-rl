@@ -1119,7 +1119,15 @@ def setup(
     # Checkpoint paths
     if last_checkpoint_path:
         weights_path = Path(last_checkpoint_path) / "policy" / "weights"
-        optimizer_path = Path(last_checkpoint_path) / "policy" / "optimizer"
+        optimizer_path_candidate = Path(last_checkpoint_path) / "policy" / "optimizer"
+        if optimizer_path_candidate.is_dir() and any(optimizer_path_candidate.iterdir()):
+            optimizer_path = optimizer_path_candidate
+        else:
+            optimizer_path = None
+            print(
+                "  ⚠️ Optimizer checkpoint missing; resuming with model weights only.",
+                flush=True,
+            )
     else:
         weights_path = None
         optimizer_path = None
@@ -1606,6 +1614,11 @@ def distillation_train(
                     if master_config["checkpointing"]["enabled"] and (
                         should_save_by_step or should_save_by_timeout
                     ):
+                        # Save full state for final/timeout checkpoints; keep periodic
+                        # checkpoints lightweight to reduce host-memory spikes.
+                        should_save_optimizer_state = (
+                            is_last_step or should_save_by_timeout
+                        )
                         student_policy.prepare_for_training()
 
                         distillation_save_state["current_epoch"] = current_epoch
@@ -1650,20 +1663,29 @@ def distillation_train(
                                 )
 
                         with timer.time("checkpointing"):
-                            print(
-                                f"Saving checkpoint for step {total_steps + 1}...",
-                                flush=True,
-                            )
+                            if should_save_optimizer_state:
+                                print(
+                                    f"Saving full checkpoint for step {total_steps + 1}...",
+                                    flush=True,
+                                )
+                            else:
+                                print(
+                                    f"Saving weights-only checkpoint for step {total_steps + 1}...",
+                                    flush=True,
+                                )
                             checkpoint_path = checkpointer.init_tmp_checkpoint(
                                 total_steps + 1, distillation_save_state, master_config
+                            )
+                            optimizer_checkpoint_path = (
+                                os.path.join(checkpoint_path, "policy", "optimizer")
+                                if should_save_optimizer_state
+                                else None
                             )
                             student_policy.save_checkpoint(
                                 weights_path=os.path.join(
                                     checkpoint_path, "policy", "weights"
                                 ),
-                                optimizer_path=os.path.join(
-                                    checkpoint_path, "policy", "optimizer"
-                                ),
+                                optimizer_path=optimizer_checkpoint_path,
                                 tokenizer_path=os.path.join(
                                     checkpoint_path, "policy", "tokenizer"
                                 ),
@@ -1916,6 +1938,9 @@ def validate(
                     ],
                     greedy=False,
                 )
+            # Sleep vLLM workers to free GPU memory before teacher/student inference
+            policy_generation.finish_generation()
+
             rewards = val_batch["total_reward"]
             batch_size = len(rewards)
 
@@ -1994,9 +2019,8 @@ def validate(
                 )
                 distill_validation_metrics_by_batch.append(val_step_metrics)
 
-                if policy_generation is student_policy:
-                    with timer.time("validation_prepare_for_generation"):
-                        policy_generation.prepare_for_generation()
+            # Re-wake vLLM workers for next validation batch generation
+            policy_generation.prepare_for_generation()
 
         if track_train_metrics and not teacher_should_stay_resident:
             assert teacher_policy is not None
