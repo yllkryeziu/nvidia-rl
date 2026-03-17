@@ -58,6 +58,7 @@ def _message(role: str, content: str, token_ids: list[int]) -> dict[str, object]
 def test_extract_first_think_span():
     text = "<think>first trace</think> answer <think>second</think>"
     assert extract_first_think_span(text) == "first trace"
+    assert extract_first_think_span("<think>unterminated trace") == "unterminated trace"
     assert extract_first_think_span("no think tags here") == ""
 
 
@@ -224,6 +225,44 @@ def test_build_teacher_batch_static_trace_source_uses_dataset_answer():
     assert tokenizer.last_chat_payload is not None
     assert "dataset trace words" in tokenizer.last_chat_payload
     assert "live trace" not in tokenizer.last_chat_payload
+
+
+def test_build_teacher_batch_static_trace_without_closing_think_tag_is_used():
+    tokenizer = DummyTokenizer()
+    message_logs = [
+        [
+            _message("user", "solve x", [10, 11]),
+            _message(
+                "assistant",
+                "<think>live trace</think> final",
+                [20, 21, 22],
+            ),
+        ]
+    ]
+
+    result = build_context_distillation_teacher_batch(
+        message_logs=message_logs,  # type: ignore[arg-type]
+        sample_mask=torch.tensor([1.0], dtype=torch.float32),
+        student_input_lengths=torch.tensor([5], dtype=torch.long),
+        tokenizer=tokenizer,
+        teacher_prefix_template="P {problem} T {trace}",
+        max_teacher_sequence_length=64,
+        pad_token_id=tokenizer.pad_token_id,
+        extra_env_infos=[
+            {
+                "problem": "solve x",
+                "qwen3_1b7_original_answer": "<think>dataset trace without closing tag",
+            }
+        ],
+        trace_source="static_dataset",
+        static_trace_answer_column="qwen3_1b7_original_answer",
+        missing_trace_policy="drop_sample",
+    )
+
+    assert result.teacher_data is not None
+    assert result.valid_sample_indices == [0]
+    assert tokenizer.last_chat_payload is not None
+    assert "dataset trace without closing tag" in tokenizer.last_chat_payload
 
 
 def test_build_teacher_batch_static_trace_missing_drops_sample():

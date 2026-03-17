@@ -80,20 +80,31 @@ for STEP in $STEPS_NORM; do
         [[ "$CONTINUE_ON_ERROR" -eq 1 ]] && continue || exit 1
     fi
 
-    INPUT_DIR="${CHECKPOINT_DIR}/step_${STEP}/policy/weights/model"
     OUTPUT_DIR="${CHECKPOINT_DIR}/step_${STEP}/consolidated"
     TOKENIZER_DIR="${CHECKPOINT_DIR}/step_${STEP}/policy/tokenizer"
+    WEIGHTS_DIR="${CHECKPOINT_DIR}/step_${STEP}/policy/weights"
 
     echo "[INFO] Ensuring consolidated checkpoint for step_${STEP}"
-    echo "       input:  $INPUT_DIR"
     echo "       output: $OUTPUT_DIR"
 
     if [[ -f "${OUTPUT_DIR}/config.json" ]]; then
         echo "[INFO] Already consolidated: $OUTPUT_DIR"
         continue
     fi
-    if [[ ! -d "$INPUT_DIR" ]]; then
-        echo "[ERROR] Missing sharded checkpoint dir: $INPUT_DIR" >&2
+
+    # Auto-detect sharded checkpoint dir: prefer iter_* (Megatron), fall back to 'model'
+    INPUT_DIR=""
+    if [[ -d "$WEIGHTS_DIR" ]]; then
+        INPUT_DIR="$(find "$WEIGHTS_DIR" -maxdepth 1 -type d -name 'iter_*' | sort | tail -1)"
+        if [[ -z "$INPUT_DIR" && -d "$WEIGHTS_DIR/model" ]]; then
+            INPUT_DIR="$WEIGHTS_DIR/model"
+        fi
+    fi
+
+    echo "       input:  ${INPUT_DIR:-<not found>}"
+
+    if [[ -z "$INPUT_DIR" || ! -d "$INPUT_DIR" ]]; then
+        echo "[ERROR] Missing sharded checkpoint dir under $WEIGHTS_DIR" >&2
         overall_rc=1
         [[ "$CONTINUE_ON_ERROR" -eq 1 ]] && continue || exit 1
     fi

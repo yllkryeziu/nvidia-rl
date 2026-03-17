@@ -24,6 +24,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 
 THINK_PATTERN = re.compile(r"<think>(.*?)</think>", flags=re.DOTALL)
+THINK_OPEN_PATTERN = re.compile(r"<think>(.*)", flags=re.DOTALL)
 
 
 @dataclass
@@ -49,9 +50,16 @@ class ContextDistillationBuildResult:
 
 def extract_first_think_span(text: str) -> str:
     match = THINK_PATTERN.search(text)
-    if not match:
+    if match:
+        return match.group(1).strip()
+
+    # Static traces can be truncated and miss the closing </think> tag.
+    # In that case, keep the remainder of the text instead of treating the
+    # trace as missing.
+    open_match = THINK_OPEN_PATTERN.search(text)
+    if not open_match:
         return ""
-    return match.group(1).strip()
+    return open_match.group(1).strip()
 
 
 def _tokenize_text(

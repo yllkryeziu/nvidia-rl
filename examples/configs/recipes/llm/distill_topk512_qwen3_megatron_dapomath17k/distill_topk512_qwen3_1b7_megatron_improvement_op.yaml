@@ -317,6 +317,8 @@ teacher:
     - milestones: [10]
   generation:
     temperature: 0.6  # used for teacher logit scaling; the frozen teacher does not generate in this recipe
+    colocated:
+      enabled: false
 
 data:
   max_input_seq_length: 4096
