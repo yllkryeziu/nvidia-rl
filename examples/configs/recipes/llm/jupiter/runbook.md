@@ -32,19 +32,19 @@ jupiter/
 └── runbook.md
 ```
 
-All configs use Megatron backend, colocated vLLM, batch 256, val every 10 steps (256 samples), checkpointing every 10 steps.
+All configs use Megatron backend, resource-isolated vLLM (separate generation nodes, teacher off GPU), batch 256, val every 10 steps (256 samples), checkpointing every 10 steps.
 
 ---
 
 ## Scaling summary
 
-| Model | Nodes | Policy TP/PP/DP | Teacher TP/PP | vLLM TP | Grad accum | LR   |
-|-------|-------|-----------------|---------------|---------|------------|------|
-| 1.7B  | 1     | 2/2/1           | 2/1           | 1       | 256        | 1e-5 |
-| 4B    | 1     | 2/2/1           | 2/1           | 1       | 256        | 1e-5 |
-| 8B    | 2     | 2/2/2           | 2/1           | 1       | 128        | 5e-6 |
-| 14B   | 2     | 4/2/1           | 4/1           | 2       | 256        | 3e-6 |
-| 32B   | 4     | 4/2/2           | 4/1           | 4       | 128        | 3e-6 |
+| Model | Nodes | Train / Gen / Teacher split | Policy TP/PP/DP | Teacher TP/PP | vLLM TP | Grad accum | LR   |
+|-------|-------|---------------------------- |-----------------|---------------|---------|------------|------|
+| 1.7B  | 3     | 1 + 1 + 1                   | 2/2/1           | 2/1           | 1       | 256        | 1e-5 |
+| 4B    | 3     | 1 + 1 + 1                   | 2/2/1           | 2/1           | 1       | 256        | 1e-5 |
+| 8B    | 6     | 2 + 2 + 2                   | 2/2/2           | 2/1           | 1       | 128        | 5e-6 |
+| 14B   | 6     | 2 + 2 + 2                   | 4/2/1           | 4/1           | 2       | 256        | 3e-6 |
+| 32B   | 12    | 4 + 4 + 4                   | 4/2/2           | 4/1           | 4       | 128        | 3e-6 |
 
 **Note**: 32B configs use `qwen3_14b` traces across all datasets (32B traces not yet generated).
 
@@ -54,39 +54,39 @@ All configs use Megatron backend, colocated vLLM, batch 256, val every 10 steps 
 
 Dataset: 89k math problems filtered by `domain=math` | `input_key=problem` | `output_key=ground_truth_solution`
 
-### 1.7B — 1 node
+### 1.7B — 3 nodes
 
 ```bash
 COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/jupiter/openthoughts114k-math-qwen3/distill_topk512_qwen3_1b7_1node_p256_v256.yaml'
-sbatch -J distill-ot-qwen3-1b7 -N1 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
+sbatch -J distill-ot-qwen3-1b7 -N3 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
 ```
 
-### 4B — 1 node
+### 4B — 3 nodes
 
 ```bash
 COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/jupiter/openthoughts114k-math-qwen3/distill_topk512_qwen3_4b_1node_p256_v256.yaml'
-sbatch -J distill-ot-qwen3-4b -N1 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
+sbatch -J distill-ot-qwen3-4b -N3 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
 ```
 
-### 8B — 2 nodes
+### 8B — 6 nodes
 
 ```bash
 COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/jupiter/openthoughts114k-math-qwen3/distill_topk512_qwen3_8b_2node_p256_v256.yaml'
-sbatch -J distill-ot-qwen3-8b -N2 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
+sbatch -J distill-ot-qwen3-8b -N6 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
 ```
 
-### 14B — 2 nodes
+### 14B — 6 nodes
 
 ```bash
 COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/jupiter/openthoughts114k-math-qwen3/distill_topk512_qwen3_14b_2node_p256_v256.yaml'
-sbatch -J distill-ot-qwen3-14b -N2 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
+sbatch -J distill-ot-qwen3-14b -N6 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
 ```
 
-### 32B — 4 nodes
+### 32B — 12 nodes
 
 ```bash
 COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/jupiter/openthoughts114k-math-qwen3/distill_topk512_qwen3_32b_4node_p256_v256.yaml'
-sbatch -J distill-ot-qwen3-32b -N4 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
+sbatch -J distill-ot-qwen3-32b -N12 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
 ```
 
 ---
@@ -95,39 +95,39 @@ sbatch -J distill-ot-qwen3-32b -N4 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" r
 
 Dataset: 17k math problems, no filter | `input_key=problem` | `output_key=answer`
 
-### 1.7B — 1 node
+### 1.7B — 3 nodes
 
 ```bash
 COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/jupiter/dapo-math-17k-qwen3/distill_topk512_qwen3_1b7_1node_p256_v256.yaml'
-sbatch -J distill-dapo-qwen3-1b7 -N1 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
+sbatch -J distill-dapo-qwen3-1b7 -N3 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
 ```
 
-### 4B — 1 node
+### 4B — 3 nodes
 
 ```bash
 COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/jupiter/dapo-math-17k-qwen3/distill_topk512_qwen3_4b_1node_p256_v256.yaml'
-sbatch -J distill-dapo-qwen3-4b -N1 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
+sbatch -J distill-dapo-qwen3-4b -N3 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
 ```
 
-### 8B — 2 nodes
+### 8B — 6 nodes
 
 ```bash
 COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/jupiter/dapo-math-17k-qwen3/distill_topk512_qwen3_8b_2node_p256_v256.yaml'
-sbatch -J distill-dapo-qwen3-8b -N2 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
+sbatch -J distill-dapo-qwen3-8b -N6 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
 ```
 
-### 14B — 2 nodes
+### 14B — 6 nodes
 
 ```bash
 COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/jupiter/dapo-math-17k-qwen3/distill_topk512_qwen3_14b_2node_p256_v256.yaml'
-sbatch -J distill-dapo-qwen3-14b -N2 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
+sbatch -J distill-dapo-qwen3-14b -N6 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
 ```
 
-### 32B — 4 nodes
+### 32B — 12 nodes
 
 ```bash
 COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/jupiter/dapo-math-17k-qwen3/distill_topk512_qwen3_32b_4node_p256_v256.yaml'
-sbatch -J distill-dapo-qwen3-32b -N4 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
+sbatch -J distill-dapo-qwen3-32b -N12 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
 ```
 
 ---
@@ -136,37 +136,37 @@ sbatch -J distill-dapo-qwen3-32b -N4 -t 12:00:00 --export=ALL,COMMAND="$COMMAND"
 
 Dataset: 103k math problems, no filter | `input_key=question` | `output_key=final_answer`
 
-### 1.7B — 1 node
+### 1.7B — 3 nodes
 
 ```bash
 COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/jupiter/deepmath-103k-qwen3/distill_topk512_qwen3_1b7_1node_p256_v256.yaml'
-sbatch -J distill-dm-qwen3-1b7 -N1 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
+sbatch -J distill-dm-qwen3-1b7 -N3 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
 ```
 
-### 4B — 1 node
+### 4B — 3 nodes
 
 ```bash
 COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/jupiter/deepmath-103k-qwen3/distill_topk512_qwen3_4b_1node_p256_v256.yaml'
-sbatch -J distill-dm-qwen3-4b -N1 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
+sbatch -J distill-dm-qwen3-4b -N3 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
 ```
 
-### 8B — 2 nodes
+### 8B — 6 nodes
 
 ```bash
 COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/jupiter/deepmath-103k-qwen3/distill_topk512_qwen3_8b_2node_p256_v256.yaml'
-sbatch -J distill-dm-qwen3-8b -N2 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
+sbatch -J distill-dm-qwen3-8b -N6 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
 ```
 
-### 14B — 2 nodes
+### 14B — 6 nodes
 
 ```bash
 COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/jupiter/deepmath-103k-qwen3/distill_topk512_qwen3_14b_2node_p256_v256.yaml'
-sbatch -J distill-dm-qwen3-14b -N2 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
+sbatch -J distill-dm-qwen3-14b -N6 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
 ```
 
-### 32B — 4 nodes
+### 32B — 12 nodes
 
 ```bash
 COMMAND='uv run python examples/run_distillation.py --config examples/configs/recipes/llm/jupiter/deepmath-103k-qwen3/distill_topk512_qwen3_32b_4node_p256_v256.yaml'
-sbatch -J distill-dm-qwen3-32b -N4 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
+sbatch -J distill-dm-qwen3-32b -N12 -t 12:00:00 --export=ALL,COMMAND="$COMMAND" ray_bare_jupiter.sub
 ```

@@ -883,8 +883,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 checkpointing_cfg is not None
                 and checkpointing_cfg.get("model_save_format", None) is not None
             ):
-                raise ValueError(
-                    "model_save_format must be None or omitted if using DTensorPolicyWorker (_v2=False)."
+                warnings.warn(
+                    "Ignoring checkpointing.model_save_format outside DTensorPolicyWorkerV2; "
+                    "format selection is only supported by DTensorPolicyWorkerV2.",
+                    stacklevel=2,
                 )
             futures = self.worker_group.run_all_workers_single_data(
                 "save_checkpoint",

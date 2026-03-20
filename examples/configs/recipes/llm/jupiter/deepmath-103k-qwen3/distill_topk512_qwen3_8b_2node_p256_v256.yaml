@@ -4,9 +4,9 @@ distillation:
   max_rollout_turns: 1
   max_num_steps: 150
   max_num_epochs: 1
-  val_batch_size: 32
+  val_batch_size: 256
   val_period: 10
-  val_at_start: false
+  val_at_start: true
   val_at_end: false
   max_val_samples: 256
   val_track_train_metrics: true
@@ -75,8 +75,8 @@ distillation:
     metrics:
       enabled: true
   resource_isolation:
-    enabled: false
-    teacher_resident_on_gpu: true
+    enabled: true
+    teacher_resident_on_gpu: false
     roles:
       training:
         num_nodes: 2
@@ -101,7 +101,7 @@ checkpointing:
   keep_top_k: null
   save_period: 10
   checkpoint_must_save_by: null
-  model_save_format: safetensors
+  model_save_format: null
   save_consolidated: true
 
 policy:
@@ -111,9 +111,9 @@ policy:
     chat_template_kwargs:
       enable_thinking: true
   train_global_batch_size: 256
-  train_micro_batch_size: 1
-  generation_batch_size: 16
-  logprob_batch_size: 1
+  train_micro_batch_size: 2
+  generation_batch_size: 256
+  logprob_batch_size: 4
   max_total_sequence_length: 20480
   precision: bfloat16
   logprob_chunk_size: null
@@ -141,7 +141,7 @@ policy:
     tensor_model_parallel_size: 2
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 1
-    pipeline_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
     context_parallel_size: 1
@@ -240,7 +240,7 @@ policy:
       load_format: dummy
       skip_tokenizer_init: true
     colocated:
-      enabled: true
+      enabled: false
       resources:
         gpus_per_node: null
         num_nodes: null
@@ -288,7 +288,7 @@ teacher:
     num_layers_in_last_pipeline_stage: null
     context_parallel_size: 1
     pipeline_dtype: bfloat16
-    sequence_parallel: true
+    sequence_parallel: false
     freeze_moe_router: true
     moe_router_dtype: fp64
     moe_router_load_balancing_type: none
@@ -402,4 +402,4 @@ logger:
 
 cluster:
   gpus_per_node: 4
-  num_nodes: 2
+  num_nodes: 6
